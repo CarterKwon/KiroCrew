@@ -74,12 +74,18 @@ def _url_payload_command(n: int) -> str:
 #: where this machine's address list cannot be read, so a refused agent knows when
 #: to stop retrying and what to use instead.
 #:
+#: Raised again for the gateway-owned push-verdict gate: a new
+#: ``push_verdict.py`` submodule (~874 lines) that reads the operator activation leaf
+#: and answers the publish floor's verdict question, plus the floor's own binding
+#: checks and the new write-protected ``push-verdict-mirrors`` entries in ``__init__.py``.
+#: Its own tests live in ``test_push_verdict_gate.py``; this bound only tracks volume.
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 27_766
+_PACKAGE_LINE_BUDGET = 28_787
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

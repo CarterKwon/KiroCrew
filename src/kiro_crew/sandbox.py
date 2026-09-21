@@ -561,6 +561,11 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # turn computer use on for itself.
     "denied_commands.json",
     "computer_use.json",
+    # A writable push-verdict enable lets an auto-approved agent switch its own publish
+    # gate off, which is the same shape as the two leaves above it. A writable mirror lets it
+    # plant the base its own push is then judged against, which is the same shape again.
+    "push-verdict-activation.json",
+    "push-verdict-mirrors",
     "oauth_endpoints.json",
     "aws_service_consent.json",
     # Recorded consent to send conversation state to the external decision
@@ -864,6 +869,8 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     "profiles",
     "denied_commands.json",
     "computer_use.json",
+    "push-verdict-activation.json",
+    "push-verdict-mirrors",
     "oauth_endpoints.json",
     "decisions_consent.json",
     "file_delivery_consent.json",
@@ -1514,6 +1521,14 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # Pre-creation gives Linux concrete bind targets on a fresh install.
     "mcp-launch-approvals",
     "mcp/resolved",
+    # The push-verdict mirrors, the bare repositories the gateway judges a branch in.
+    # Same mechanism as ``panel-templates`` and ``decisions``: the read-only listing
+    # seals an EXISTING path only, and on a fresh activated install no verdict has been
+    # requested yet, so the directory is absent, the mount is skipped, and the agent can
+    # create it and plant the base commit its own push is then measured against. That is
+    # the write the read-only listing exists to deny, so without this entry the listing
+    # protects only hosts that have already run a judgement.
+    "push-verdict-mirrors",
 )
 #: Read-only directory leaves whose NAME must remain the mounted name. A resolving
 #: symlink is unsafe here: the mount follows its target and leaves the lexical name
@@ -1530,6 +1545,11 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "pi-gate",
     "mcp-launch-approvals",
     "mcp/resolved",
+    # The mirrors, for the same reason as ``decisions``: a resolving symlink leaves the
+    # lexical name replaceable, and the party that would replace it is the one whose push
+    # the mirror's contents decide. A planted link would let the agent choose the
+    # repository the ancestry check runs in.
+    "push-verdict-mirrors",
 )
 assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 #: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
@@ -1598,6 +1618,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed resolved MCP launches",
         "the agent could replace the executable the gateway substitutes for an approved launch",
     ),
+    "push-verdict-mirrors": (
+        "sealed push verdict mirrors",
+        "the agent could plant the base commit its own push is then measured against",
+    ),
 }
 assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_LEAVES) | set(
     _CREW_NOFOLLOW_READONLY_DIR_LEAVES
@@ -1613,6 +1637,7 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # previous launch found" rather than acting on one, which is narrower than the truth.
     "cloud_launch_state.json",
     "computer_use.json",
+    "push-verdict-activation.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
     "decisions_consent.json",
@@ -7853,11 +7878,47 @@ def _ssh_supports_accept_new() -> bool:
     return False
 
 
+def _push_verdict_masks_ssh() -> bool:
+    """Whether an agent spawn must lose ``~/.ssh`` because push-verdict gating is active.
+
+    An activated push-verdict installation gates the agent's OWN visible ``git push`` at the
+    argv floor, but an opaque subprocess (an interpreter that shells out to git from compiled
+    code) presents no publish source for the floor to judge. Outside the strict tier ``~/.ssh``
+    is otherwise readable, so that subprocess authenticates over SSH and lands a commit the gate
+    never saw. Withholding the key from every agent subprocess on an activated install closes
+    that path: the gateway-owned publish, which runs outside this sandbox, is the one operation
+    that keeps its SSH access.
+
+    FAIL CLOSED. Absence of the keystone means nobody activated gating, so the key stays
+    readable and a normal install is unchanged. Anything else -- an unreadable or corrupt leaf,
+    or an unexpected read error -- masks the key, because a readable key on an install whose
+    operator turned gating on is the exact hole, and an unreadable record is not the same as
+    gating being off. The read matches the argv floor's own treatment of the same leaf.
+
+    Imported lazily: ``sandbox`` is a low-level module and ``push_verdict`` reads the keystone
+    through ``config.paths``, so the import is deferred to call time to avoid an import cycle,
+    mirroring the other function-local ``kiro_crew.security`` imports in this module.
+    """
+    try:
+        from kiro_crew.security import push_verdict
+    except Exception:
+        # An import error here is a defect in this tree, not an unactivated install; treat it
+        # the same conservative way the read errors below are treated and mask the key.
+        return True
+    try:
+        return push_verdict.activation_enabled()
+    except push_verdict.ActivationUnreadable:
+        return True
+    except Exception:
+        return True
+
+
 def _build_launcher_script(
     sandbox_level: str = "strict",
     *,
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_alias_credential_ids: tuple[tuple[int, int], ...] = (),
@@ -7915,9 +7976,25 @@ def _build_launcher_script(
     # socket). Applied last so the whole assembled set is filtered. The
     # strict-tier ~/.ssh hide below is unaffected (the agent socket lives in
     # $TMPDIR/tmp, outside ~/.ssh), so key material stays unreadable while the
-    # socket becomes usable.
+    # socket becomes usable in the strict tier.
     env_prefixes = _agent_scrub_prefixes(env_prefixes, forward_ssh_auth_sock)
-    hide_ssh = sandbox_level == "strict"
+    # ``~/.ssh`` is hidden in the strict tier always, and ALSO in every agent tier once
+    # push-verdict gating is activated: on such an install the agent's own visible ``git
+    # push`` is judged at the argv floor, but an opaque subprocess reaches the private key
+    # and pushes past the floor, so the key is withheld from agent subprocesses and left only
+    # to the gateway-owned publish. The forwarded SSH agent socket is an equivalent publish
+    # credential -- an opaque subprocess authenticates over it just as it would over the key --
+    # so under the activation mask the socket is ALSO withheld from agent subprocesses,
+    # re-scrubbing ``SSH_AUTH_SOCK`` even where ``forward_ssh_auth_sock`` re-admitted it above.
+    # ``gateway_publish`` is that one exempt caller -- it runs OUTSIDE this sandbox conceptually
+    # but still routes git through the chokepoint, so it opts out of the activation mask and
+    # keeps both the key and the socket to publish; it is threaded True only from the gateway
+    # publish path, defaulting False so no agent-influenced spawn can claim it. The known_hosts
+    # carve below is unchanged, so legitimate host verification still works.
+    push_verdict_activation_mask = not gateway_publish and _push_verdict_masks_ssh()
+    if push_verdict_activation_mask and "SSH_AUTH_SOCK" not in env_prefixes:
+        env_prefixes = env_prefixes + ["SSH_AUTH_SOCK"]
+    hide_ssh = sandbox_level == "strict" or push_verdict_activation_mask
     hidden_dirs = [os.path.join(home, d) for d in dirs]
     # Re-anchor the SAME tier list under a pod child's remapped home. Must run here
     # rather than at the ACP call sites: both transports freeze the sandbox before
@@ -8788,7 +8865,7 @@ def main():
                 _mount_or_die(empty_path.encode(), target, _MS_BIND,
                               "hiding sensitive file %s" % f)
 
-        # .ssh: hide keys but expose known_hosts content (strict only)
+        # .ssh: hide keys but expose known_hosts content (whenever HIDE_SSH is set)
         if HIDE_SSH and os.path.isdir(SSH_DIR):
             kh_data = b""
             if os.path.isfile(SSH_KNOWN_HOSTS):
@@ -9267,6 +9344,7 @@ def namespace_argv(
     *,
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_alias_credential_ids: tuple[tuple[int, int], ...] = (),
@@ -9331,6 +9409,7 @@ def namespace_argv(
         sandbox_level,
         strip_python_env=strip_python_env,
         forward_ssh_auth_sock=forward_ssh_auth_sock,
+        gateway_publish=gateway_publish,
         extra_hidden_dirs=extra_hidden_dirs + tuple(m.path for m in alias_masks),
         extra_hidden_dir_ids=extra_hidden_dir_ids,
         extra_alias_credential_ids=extra_alias_credential_ids,
@@ -9472,6 +9551,7 @@ _SEATBELT_PROFILE = """\
 def _build_seatbelt_profile(
     sandbox_level: str = "strict",
     *,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
@@ -9710,9 +9790,13 @@ def _build_seatbelt_profile(
         rules.append(f'(deny file-write* (literal "{escaped}"))')
         rules.append(f'(deny file-link (literal "{escaped}"))')
 
-    # .ssh: deny all access except reading known_hosts (strict only)
+    # .ssh: deny all access except reading known_hosts. Applied in the strict tier always,
+    # and in every agent tier once push-verdict gating is activated -- an activated install
+    # judges the agent's own ``git push`` at the argv floor, but an opaque subprocess reaches
+    # the private key and pushes past it, so the key is withheld here too and left only to the
+    # gateway-owned publish. ``gateway_publish`` is that one exempt caller and keeps SSH.
     ssh_guards: list[str] = []
-    if sandbox_level == "strict":
+    if sandbox_level == "strict" or (not gateway_publish and _push_verdict_masks_ssh()):
         ssh_dir = os.path.join(home, ".ssh")
         ssh_guards.append(ssh_dir)
         ssh_escaped = ssh_dir.replace('"', '\\"')
@@ -10210,6 +10294,7 @@ def sandbox_exec_argv(
     *,
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
@@ -10337,6 +10422,7 @@ def sandbox_exec_argv(
             )
     profile = _build_seatbelt_profile(
         sandbox_level,
+        gateway_publish=gateway_publish,
         # These entries become path RULES, not binds over an inode. That is weaker than it
         # first appears: the rule keeps naming a path, and nothing here denies a write to the
         # alias's parent or its ancestors while the data home root stays writable in-sandbox,
@@ -12887,6 +12973,7 @@ def wrap_argv(
     *,
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_alias_credential_ids: tuple[tuple[int, int], ...] = (),
@@ -13246,6 +13333,7 @@ def wrap_argv(
                     sandbox_level,
                     strip_python_env=strip_python_env,
                     forward_ssh_auth_sock=forward_ssh_auth_sock,
+                    gateway_publish=gateway_publish,
                     extra_hidden_dirs=extra_hidden_dirs,
                     extra_hidden_dir_ids=extra_hidden_dir_ids,
                     extra_visible_dirs=extra_visible_dirs,
@@ -13271,6 +13359,7 @@ def wrap_argv(
                     sandbox_level,
                     strip_python_env=strip_python_env,
                     forward_ssh_auth_sock=forward_ssh_auth_sock,
+                    gateway_publish=gateway_publish,
                 )
 
     backend = detect_backend(config_mode=mode)
@@ -13288,6 +13377,7 @@ def wrap_argv(
                 sandbox_level,
                 strip_python_env=strip_python_env,
                 forward_ssh_auth_sock=forward_ssh_auth_sock,
+                gateway_publish=gateway_publish,
                 extra_hidden_dirs=extra_hidden_dirs,
                 extra_hidden_dir_ids=extra_hidden_dir_ids,
                 extra_alias_credential_ids=extra_alias_credential_ids,
@@ -13303,6 +13393,7 @@ def wrap_argv(
                 sandbox_level,
                 strip_python_env=strip_python_env,
                 forward_ssh_auth_sock=forward_ssh_auth_sock,
+                gateway_publish=gateway_publish,
             )
         # Caller deletes the generated launcher script. Its position is
         # ``1 + len(flags)``, NOT a hardcoded 1: the interpreter flags sit between
@@ -13323,6 +13414,7 @@ def wrap_argv(
                 sandbox_level,
                 strip_python_env=strip_python_env,
                 forward_ssh_auth_sock=forward_ssh_auth_sock,
+                gateway_publish=gateway_publish,
                 extra_hidden_dirs=extra_hidden_dirs,
                 extra_hidden_dir_ids=extra_hidden_dir_ids,
                 extra_visible_dirs=extra_visible_dirs,
@@ -13336,6 +13428,7 @@ def wrap_argv(
             sandbox_level,
             strip_python_env=strip_python_env,
             forward_ssh_auth_sock=forward_ssh_auth_sock,
+            gateway_publish=gateway_publish,
         )
 
     if backend == "none":
@@ -13798,6 +13891,7 @@ def sandboxed_spawn_argv(
     *,
     env: dict[str, str] | None = None,
     strip_python_env: bool = False,
+    gateway_publish: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
@@ -13830,6 +13924,10 @@ def sandboxed_spawn_argv(
             hidden in both the macOS Seatbelt and Linux namespace profiles.
         extra_visible_dirs: Trusted paths that must remain visible when an
             otherwise-hidden parent contains them (the whole parent's mask is lifted).
+        gateway_publish: Threaded to :func:`wrap_argv`. Marks the ONE gateway-owned
+            operation that keeps ``~/.ssh`` on a push-verdict-activated install so it
+            can publish; every agent-influenced spawn leaves it False and loses the key
+            on such an install. Only the gateway publish path passes True.
         extra_private_dirs: The spawn's OWN directories inside a hidden tree
             (its ``agent_scratch`` dir under the masked scratch root). Re-exposed
             read-write as a window; the parent's mask and every sibling stay hidden.
@@ -13861,6 +13959,7 @@ def sandboxed_spawn_argv(
             argv,
             mode=mode,
             strip_python_env=strip_python_env,
+            gateway_publish=gateway_publish,
             extra_hidden_dirs=extra_hidden_dirs,
             extra_visible_dirs=extra_visible_dirs,
             extra_private_dirs=extra_private_dirs,
@@ -13873,6 +13972,7 @@ def sandboxed_spawn_argv(
             argv,
             mode=mode,
             strip_python_env=strip_python_env,
+            gateway_publish=gateway_publish,
             first_party_fixed_argv=first_party_fixed_argv,
             is_kiro_cli=is_kiro_cli,
         )
