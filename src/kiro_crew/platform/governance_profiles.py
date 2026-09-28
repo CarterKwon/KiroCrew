@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1064,6 +1065,61 @@ def reset_store() -> None:
         _PROFILE_GENERATION += 1
 
 
+def rekey_task_binds(plan: Dict[str, str]) -> int:
+    """Move every ``task`` bind spelled as a key in *plan* onto the key it moved to.
+
+    Called by the one-shot member-identity migration with the SURVIVING moves of
+    ``config.agents`` (old key -> ``member_id``), so a profile an administrator
+    bound ``task:<old key>`` keeps narrowing that crew after the re-key. This is
+    the only path that rewrites a bind: it is driven by the record move itself,
+    not by a record's ``display_name`` or ``legacy_keys`` (agent-writable
+    fields), and it writes the governance-owned profiles directory once. Files
+    that cannot be read or are not a profile are left alone. Returns the number
+    of files rewritten; the store is reset when any was.
+    """
+    if not plan:
+        return 0
+    profiles_dir = _profiles_dir()
+    if not profiles_dir.is_dir():
+        return 0
+    rewritten = 0
+    for path in sorted(profiles_dir.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        bind = raw.get("bind")
+        if not isinstance(bind, dict) or bind.get("type") != "task":
+            continue
+        current = bind.get("id")
+        if not isinstance(current, str) or current not in plan or plan[current] == current:
+            continue
+        bind["id"] = plan[current]
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("profiles: could not re-key task bind in %s", path.name, exc_info=True)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            continue
+        logger.info(
+            "profiles: task bind %r -> %r in %s (member record re-keyed)",
+            current,
+            plan[current],
+            path.name,
+        )
+        rewritten += 1
+    if rewritten:
+        reset_store()
+    return rewritten
+
+
 def get_store_profile(name: str) -> Optional[Profile]:
     """Return a profile by file stem (read-only; used by ``policy``/``profile`` CLI)."""
     return _STORE.get(name)
@@ -1385,6 +1441,15 @@ def resolve_active_scope(
     def _for_bind(bind: Bind) -> Optional[Profile]:
         name = snap.by_bind.get((bind.type, bind.id))
         return snap.by_name.get(name) if name else None
+
+    # A ``task`` bind resolves by EXACT id only. ``config.agents`` is keyed by
+    # ``member_id`` and that key is what a session's ``agent`` and a spawn's
+    # ``task`` carry; a profile bound to a member's earlier key is moved onto the
+    # id by :func:`rekey_task_binds` at the same one-shot boot re-key that moves
+    # the record. The member's ``display_name`` and ``legacy_keys`` are NOT
+    # consulted here: both are agent-writable config fields, and reading them
+    # would let a record select a task profile -- which outranks the surface
+    # profile -- by spelling itself as one.
 
     if app:
         prof = _for_bind(Bind(type="app", id=app))

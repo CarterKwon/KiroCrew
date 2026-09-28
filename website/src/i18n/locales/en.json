@@ -6307,6 +6307,7 @@
       "reply": "Reply",
       "role": "Role",
       "role_e_g_logs_agent": "Role (e.g. Logs Agent)",
+      "roster_names_failed": "Couldn't load which crew each agent runs as.",
       "send": "Send",
       "setting_up_channel": "Setting up channel…",
       "task": "Task",

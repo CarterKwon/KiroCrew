@@ -9918,7 +9918,8 @@
       "failed_to_dismiss_agent": "エージェントの却下に失敗しました",
       "failed_to_update_agent": "エージェントの更新に失敗しました",
       "failed_to_close_channel": "チャネルを閉じられませんでした",
-      "failed_to_clear_context": "コンテキストのクリアに失敗しました"
+      "failed_to_clear_context": "コンテキストのクリアに失敗しました",
+      "roster_names_failed": "各エージェントがどのクルーとして動いているかを読み込めませんでした。"
     },
     "chat": {
       "activityViewer": {

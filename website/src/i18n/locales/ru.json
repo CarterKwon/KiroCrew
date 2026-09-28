@@ -10347,7 +10347,8 @@
       "failed_to_dismiss_agent": "Не удалось убрать агента",
       "failed_to_update_agent": "Не удалось обновить агента",
       "failed_to_close_channel": "Не удалось закрыть канал",
-      "failed_to_clear_context": "Не удалось очистить контекст"
+      "failed_to_clear_context": "Не удалось очистить контекст",
+      "roster_names_failed": "Не удалось загрузить, от имени какого участника команды работает каждый агент."
     },
     "chat": {
       "activityViewer": {

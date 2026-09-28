@@ -32,7 +32,7 @@ import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
-import { agentOrDefaultLabel } from '../utils/agentLabel'
+import { agentOrDefaultLabel, isHandleOf } from '../utils/agentLabel'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
 import ReasoningEffortDropdown from './ReasoningEffortDropdown'
@@ -1915,9 +1915,9 @@ export default function ChatPane({
           // SLOT's stored agent (not `paneAgentName`, which has already
           // collapsed empty->default) so an agent-less slot reads
           // `<default> · default` and a pinned one reads the bare alias (#8770).
-          agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent)}
+          agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent, installedAgents)}
           agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
-          agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
+          agentSource={installedAgents.find((a) => isHandleOf(a, paneAgentName))?.source}
           modelName={shownModel}
           reasoningEffort={effectiveEffort}
           effortIsDefault={!paneSlot?.reasoning_effort && !legacyCodexEffort(paneSlot?.model || '', '', codexPairModels) && !!defaultEffort}

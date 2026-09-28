@@ -10204,7 +10204,8 @@
       "failed_to_dismiss_agent": "Échec du retrait de l'agent",
       "failed_to_update_agent": "Échec de la mise à jour de l'agent",
       "failed_to_close_channel": "Échec de la fermeture du canal",
-      "failed_to_clear_context": "Échec de l'effacement du contexte"
+      "failed_to_clear_context": "Échec de l'effacement du contexte",
+      "roster_names_failed": "Impossible de charger sous quel membre d'équipage chaque agent s'exécute."
     },
     "chat": {
       "activityViewer": {

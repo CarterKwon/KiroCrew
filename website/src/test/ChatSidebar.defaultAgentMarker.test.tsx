@@ -127,7 +127,7 @@ function renderSidebar(opts: {
   slots?: ChatSlot[]
   history?: ChatHistoryItem[]
   defaultAgent?: string
-  installedAgents?: { name: string; source: string }[]
+  installedAgents?: { name: string; source: string; member_id?: string; display_name?: string }[]
 } = {}) {
   const slots = opts.slots ?? PAIR_SLOTS
   const history = opts.history ?? []
@@ -247,6 +247,20 @@ describe('chat sidebar session row — inherited-default marker', () => {
       installedAgents: [{ name: DEFAULT_AGENT, source: 'package' }],
     })
     expect(sessionMetaLine(container, 'inherited').className).toContain('text-[var(--aim)]')
+  })
+
+  it('names a member slot by its display name and tints it, from the stored id', () => {
+    // A member slot stores the crew's `member_id`; the roster row's `name` is
+    // the display name. The row resolves the stored id through the roster for
+    // its label, and the source lookup matches on either handle -- an exact
+    // `name ===` compare would print the id verbatim and lose the tint.
+    const { container } = renderSidebar({
+      slots: [{ key: 'k-crew', title: 'crew', running: false, messages: 1, agent: 'alice-7f3', tags: [], last_ts: LAST_TS }] as unknown as ChatSlot[],
+      installedAgents: [{ name: 'Alice', display_name: 'Alice', member_id: 'alice-7f3', source: 'package' }],
+    })
+    const line = sessionMetaLine(container, 'crew')
+    expect(label(line)).toBe('Alice')
+    expect(line.className).toContain('text-[var(--aim)]')
   })
 
   it('keeps the blank placeholder when there is no default to inherit', () => {

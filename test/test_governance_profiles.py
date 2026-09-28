@@ -100,6 +100,75 @@ def test_agent_task_binding(profiles_dir):
     assert prof is not None and prof.name == "researcher"
 
 
+def test_task_binding_never_resolves_through_agent_writable_aliases(profiles_dir):
+    """A ``task`` bind outranks the surface bind, and ``display_name`` /
+    ``legacy_keys`` are config fields an agent can write on its own record. So a
+    record that spells itself as a bound task id must NOT select that profile:
+    task binds resolve by exact id only."""
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["scout-1a2b"] = KiroCrewAgentConfig(
+        kiro_agent="kirocrew", display_name="Scout", legacy_keys=["scout", "Scout"]
+    )
+    cfg.save()
+    _write(
+        profiles_dir,
+        "scout-ceiling",
+        {
+            "name": "scout-ceiling",
+            "bind": {"type": "task", "id": "Scout"},
+            "capabilities": {"spawn": {"enabled": False}},
+        },
+    )
+    assert gp.resolve_active_scope("dashboard:slot1", agent="scout-1a2b") is None
+    assert gp.resolve_active_scope("dashboard:slot1", task="scout-1a2b") is None
+    assert gp.resolve_active_scope("dashboard:slot1", agent="scout") is None
+    # The exact id still binds, as before.
+    exact = gp.resolve_active_scope("subagent:abc", agent="Scout")
+    assert exact is not None and exact.name == "scout-ceiling"
+
+
+def test_rekey_task_binds_moves_a_profile_with_its_record(profiles_dir):
+    """The one-shot identity migration moves a ``task:<old key>`` bind onto the
+    ``member_id`` the record moved to -- driven by the record move itself, never
+    by a record's aliases -- so an administrator's per-crew ceiling keeps
+    binding after the re-key. Other binds and unrelated files are untouched."""
+    _write(
+        profiles_dir,
+        "scout-ceiling",
+        {
+            "name": "scout-ceiling",
+            "bind": {"type": "task", "id": "Scout"},
+            "capabilities": {"spawn": {"enabled": False}},
+        },
+    )
+    _write(
+        profiles_dir,
+        "cron-tight",
+        {
+            "name": "cron-tight",
+            "bind": {"type": "surface", "id": "cron"},
+            "tools": {"mode": "allow", "allow": ["fs_read"]},
+        },
+    )
+    (profiles_dir / "notes.json").write_text("not a profile", encoding="utf-8")
+
+    assert gp.rekey_task_binds({"Scout": "scout-1a2b", "Other": "other-9"}) == 1
+    moved = json.loads((profiles_dir / "scout-ceiling.json").read_text(encoding="utf-8"))
+    assert moved["bind"] == {"type": "task", "id": "scout-1a2b"}
+    assert json.loads((profiles_dir / "cron-tight.json").read_text(encoding="utf-8"))["bind"] == {
+        "type": "surface",
+        "id": "cron",
+    }
+    assert (profiles_dir / "notes.json").read_text(encoding="utf-8") == "not a profile"
+    prof = gp.resolve_active_scope("subagent:abc", agent="scout-1a2b")
+    assert prof is not None and prof.name == "scout-ceiling"
+    assert gp.resolve_active_scope("subagent:abc", agent="Scout") is None
+    # Idempotent: a second pass with the same plan rewrites nothing.
+    assert gp.rekey_task_binds({"Scout": "scout-1a2b"}) == 0
+
+
 def test_unattended_unproven_identity_denies_all(profiles_dir):
     # No bound profile, unattended surface (_hb), unproven → deny-all.
     prof = gp.resolve_active_scope("_hb")

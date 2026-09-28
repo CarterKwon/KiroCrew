@@ -9918,7 +9918,8 @@
       "failed_to_dismiss_agent": "移除代理失败",
       "failed_to_update_agent": "更新代理失败",
       "failed_to_close_channel": "关闭频道失败",
-      "failed_to_clear_context": "清除上下文失败"
+      "failed_to_clear_context": "清除上下文失败",
+      "roster_names_failed": "无法加载每个代理以哪位队友的身份运行。"
     },
     "chat": {
       "activityViewer": {

@@ -10061,7 +10061,8 @@
       "failed_to_dismiss_agent": "Agent konnte nicht entfernt werden",
       "failed_to_update_agent": "Agent konnte nicht aktualisiert werden",
       "failed_to_close_channel": "Kanal konnte nicht geschlossen werden",
-      "failed_to_clear_context": "Kontext konnte nicht gelöscht werden"
+      "failed_to_clear_context": "Kontext konnte nicht gelöscht werden",
+      "roster_names_failed": "Es konnte nicht geladen werden, als welche Crew die Agenten laufen."
     },
     "chat": {
       "activityViewer": {

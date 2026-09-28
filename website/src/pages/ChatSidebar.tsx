@@ -112,7 +112,7 @@ import { deriveAutomationStatus, MONITOR_STATUS_KEYS } from '../monitoring/autom
 import MonitorRadar from '../components/MonitorRadar'
 
 import { i18nT } from '../i18n/t'
-import { agentOrDefaultLabel } from '../utils/agentLabel'
+import { agentOrDefaultLabel, isHandleOf } from '../utils/agentLabel'
 import { useLaneScrollMemory } from '../hooks/useLaneScrollMemory'
 import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 
@@ -2155,7 +2155,7 @@ const SessionRow = memo(function SessionRow({
     // The row's own empty-state placeholder is preserved: with no agent AND no
     // default there is nothing to mark, and the literal 'default' the helper
     // degrades to would be a boot-window claim rather than a label.
-    const agentDisplay = agentName ? agentOrDefaultLabel(s.agent, defaultAgent) : ''
+    const agentDisplay = agentName ? agentOrDefaultLabel(s.agent, defaultAgent, installedAgents) : ''
     // A DIVERGENCE, not a status: the row is advertising `agentName` while a
     // different agent answers the session — usually an app agent that was
     // removed, or one whose registration has not landed yet. Shown because the
@@ -2170,7 +2170,7 @@ const SessionRow = memo(function SessionRow({
     // and optimistically-added state that predates this field.
     const effectiveAgent = s.effective_agent ?? ''
     const agentDiverged = effectiveAgent !== '' && effectiveAgent !== agentName
-    const agentMeta = installedAgents.find(a => a.name === agentName)
+    const agentMeta = installedAgents.find(a => isHandleOf(a, agentName))
     const isPackageAgent = agentMeta?.source === 'package'
     const isBuiltin = agentMeta?.source === 'builtin'
     const agentColor = isPackageAgent ? 'text-[var(--aim)]' : isBuiltin ? 'text-muted' : 'text-muted'
@@ -2661,9 +2661,11 @@ const SessionRow = memo(function SessionRow({
     // EVERY origin (dashboard, channel, cron, subagent — anything with s.agent),
     // needs no event-loop config I/O, and re-tints live when the agent's color
     // is edited. An explicit per-session color_hex/color_index still wins.
-    const agentHex = (!customHex && ci == null && s.agent)
+    const slotAgent = s.agent
+    const agentHex = (!customHex && ci == null && slotAgent)
       ? (() => {
-          const c = installedAgents.find(a => a.name === s.agent)?.session_color
+          // slotAgent is a member_id for member slots; the roster's `name` is the label.
+          const c = installedAgents.find(a => isHandleOf(a, slotAgent))?.session_color
           return typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c) ? c : null
         })()
       : null
@@ -10940,7 +10942,7 @@ function ChatSidebar({
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).
                 const agentColorFor = (agentName: string): string => {
-                  const meta = installedAgents.find(a => a.name === agentName)
+                  const meta = installedAgents.find(a => isHandleOf(a, agentName))
                   if (meta?.source === 'package') return 'text-[var(--aim)]'
                   if (meta?.source === 'builtin') return 'text-muted'
                   return 'text-muted'
@@ -10954,7 +10956,7 @@ function ChatSidebar({
                   // back to the CURRENT default, which is a different fact from
                   // a session pinned to that same alias — the marker is what
                   // tells them apart (#6529).
-                  const agentDisplay = agentName ? agentOrDefaultLabel(s.agent, defaultAgent) : ''
+                  const agentDisplay = agentName ? agentOrDefaultLabel(s.agent, defaultAgent, installedAgents) : ''
                   const agentColor = agentColorFor(agentName)
                   const isDashboard = s.key.startsWith('dashboard')
                   const channel = slotChannelNamespace(s.key)

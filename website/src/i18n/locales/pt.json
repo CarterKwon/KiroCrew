@@ -10204,7 +10204,8 @@
       "failed_to_dismiss_agent": "Falha ao dispensar o agente",
       "failed_to_update_agent": "Falha ao atualizar o agente",
       "failed_to_close_channel": "Falha ao fechar o canal",
-      "failed_to_clear_context": "Falha ao limpar o contexto"
+      "failed_to_clear_context": "Falha ao limpar o contexto",
+      "roster_names_failed": "Não foi possível carregar como qual membro da tripulação cada agente é executado."
     },
     "chat": {
       "activityViewer": {
