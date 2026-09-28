@@ -1,9 +1,12 @@
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { Check, Upload, Loader2 } from 'lucide-react'
+import { Check, Upload, Loader2, X } from 'lucide-react'
 import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
 import { parseErrorCode } from '../utils/errorReport'
+import { useAppDispatch, useAppStore } from '../store'
+import { fetchSlots } from '../store/dashboardSlice'
+import { switchSlot } from '../store/chatSlice'
 import ErrorNotice, {
   ErrorNoticeMenuItem,
   type ErrorNoticeMenuItemComponent,
@@ -49,7 +52,144 @@ function refusalMessage(e: unknown): string {
   return i18nT('components.importSessionItem.unknown_error')
 }
 
-/** Outcome of the most recent import attempt in this open menu. */
+/** A hint for the picker's default filter only: the endpoint sniffs the bytes,
+ *  so a user who renamed or unpacked the file is not locked out by it. */
+const ACCEPT = '.gz,.json,application/gzip,application/json'
+
+/** The input of the pick in progress, so a pick the user cancelled in an
+ *  engine that fires no `cancel` event is reclaimed by the next one. */
+let pendingInput: HTMLInputElement | null = null
+
+/**
+ * Open the OS file picker from an input the MENU does not own.
+ *
+ * A native picker takes window focus, and Radix menus close on window `blur`
+ * (`@radix-ui/react-menu`), which unmounts every item — so an input rendered
+ * inside the item is detached before the user confirms, its `change` event
+ * never reaches React's root listener, and the pick is silently dropped. This
+ * input lives on `document.body` with a native listener and removes itself
+ * once the pick resolves.
+ */
+function pickSessionFile(onFile: (file: File) => void): void {
+  pendingInput?.remove()
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = ACCEPT
+  input.setAttribute('aria-hidden', 'true')
+  input.tabIndex = -1
+  input.style.position = 'fixed'
+  input.style.left = '-9999px'
+  input.style.width = '1px'
+  input.style.height = '1px'
+  input.style.opacity = '0'
+  const done = () => {
+    input.remove()
+    if (pendingInput === input) pendingInput = null
+  }
+  input.addEventListener('change', () => {
+    const file = input.files?.[0]
+    done()
+    if (file) onFile(file)
+  })
+  input.addEventListener('cancel', done)
+  document.body.appendChild(input)
+  pendingInput = input
+  input.click()
+}
+
+/**
+ * The import in flight and the last refusal nobody has seen yet, outside any
+ * component: the row that started an import has usually unmounted by the time
+ * it settles (see `pickSessionFile`), so neither may live in that row's state.
+ */
+interface ImportOutcome {
+  readonly pending: boolean
+  readonly failure: string | null
+  /** Title of a session that was imported but not opened for the user. */
+  readonly imported: string | null
+}
+let outcome: ImportOutcome = { pending: false, failure: null, imported: null }
+const outcomeListeners = new Set<() => void>()
+function setOutcome(next: Partial<ImportOutcome>): void {
+  outcome = { ...outcome, ...next }
+  for (const listener of outcomeListeners) listener()
+}
+function subscribeOutcome(listener: () => void): () => void {
+  outcomeListeners.add(listener)
+  return () => { outcomeListeners.delete(listener) }
+}
+function useImportOutcome(): ImportOutcome {
+  return useSyncExternalStore(subscribeOutcome, () => outcome)
+}
+
+/** Pinned over the page rather than in its flow: it mounts above every layout,
+ *  and each of those is a full-height shell a banner would push off-screen. */
+const OVERLAY = 'fixed left-safe-offset-3 right-safe-offset-3 top-safe-offset-[56px] z-50 md:left-auto md:right-safe-offset-6 md:w-[28rem]'
+
+/**
+ * Whether opening the imported session here is something the user will see and
+ * can undo: a page that shows the session list next to the chat. Elsewhere the
+ * switch would either happen out of sight (a settings page) or strand the user
+ * in a session they did not choose (a popped-out or embedded chat, which has no
+ * sidebar to get back with).
+ */
+function opensImportHere(): boolean {
+  const path = window.location.pathname
+  return path.startsWith('/chat') || path.startsWith('/embed/sessions')
+}
+
+/**
+ * The outcome of an import whose menu row is gone, rendered in-page by the app
+ * shell. The row reports the outcome inline while it is still mounted; this is
+ * where a refusal lands once the picker's blur has closed the menu, and where
+ * an import that was not opened for the user is named.
+ */
+export function ImportSessionOutcomeNotice() {
+  const { failure, imported } = useImportOutcome()
+  if (!failure) {
+    if (imported === null) return null
+    return (
+      <div
+        role="status"
+        className={`${OVERLAY} flex items-center gap-2 rounded-lg border border-ok/30 bg-bg px-3 py-2 text-[13px] text-text shadow-lg`}
+      >
+        <Check size={14} className="shrink-0 text-ok" />
+        <span className="min-w-0 flex-1 truncate" title={imported || undefined}>
+          {imported
+            ? i18nT('components.importSessionItem.imported_named', { title: imported })
+            : i18nT('components.importSessionItem.imported')}
+        </span>
+        <button
+          type="button"
+          onClick={() => setOutcome({ imported: null })}
+          aria-label={i18nT('components.errorNotice.dismiss')}
+          className="shrink-0 rounded p-1 text-muted hover:text-text"
+        >
+          <X size={14} />
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className={`${OVERLAY} rounded-lg bg-bg shadow-lg`}>
+      {/* `askAgent` is on: the hand-off navigates away, and this notice holds
+          no unsaved input to lose. */}
+      {/* Its own title, not the row's bare "Failed": out here, minutes after
+          the pick and on any page, the title is what says it was the import. */}
+      <ErrorNotice
+        title={i18nT('components.importSessionItem.unknown_error')}
+        message={failure}
+        onDismiss={() => setOutcome({ failure: null })}
+        // The hand-off navigates to the chat it opens; a notice left over it
+        // would describe an import the user has already handed on.
+        onHandoff={() => setOutcome({ failure: null })}
+        askAgent
+      />
+    </div>
+  )
+}
+
+/** Outcome of the most recent import attempt, while the row is still mounted. */
 type ImportState =
   | { kind: 'idle' }
   | { kind: 'importing' }
@@ -79,34 +219,64 @@ interface ImportSessionItemProps {
  * user who unpacked the archive by hand is not thereby holding a file the
  * product refuses.
  *
- * **The menu deliberately stays open on select** and the outcome renders on the
- * row, matching `ExportSessionItem` and `SendToInstanceSubmenu`. A new session
- * appearing in the sidebar is easy to miss, and there is no toast primitive in
- * this app; the sibling convention is an inline note next to the control, and
- * the row IS the control.
+ * **The outcome does not depend on the menu staying open.** Selecting the row
+ * prevents the select-close, but the picker itself blurs the window and Radix
+ * closes the menu then anyway. So a success OPENS the imported session — the
+ * one signal that survives the menu — and a refusal the unmounted row can no
+ * longer show goes to `ImportSessionOutcomeNotice`. While the row is still
+ * mounted it reports the outcome inline, and an import in flight keeps the row
+ * disabled across remounts, so reopening the menu cannot start a second one.
  */
 export default function ImportSessionItem({ Item }: ImportSessionItemProps) {
   const errorId = useId()
+  const dispatch = useAppDispatch()
+  const store = useAppStore()
+  // The session open when the pick landed, so a slow upload does not pull the
+  // user out of a session they opened while it ran.
+  const originRef = useRef<string | null>(null)
   const [state, setState] = useState<ImportState>({ kind: 'idle' })
-  const inputRef = useRef<HTMLInputElement>(null)
+  const { pending } = useImportOutcome()
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
+  // Option-level callbacks, not `mutate()` ones: the row has usually unmounted
+  // before the pick lands, and only these run for an unmounted observer.
   const importMutation = useMutation({
     mutationFn: (file: File) => api.importSessionFromFile(file),
-    onMutate: () => { setState({ kind: 'importing' }) },
-    onSuccess: (r) => { setState({ kind: 'done', title: r.title }) },
-    onError: (e) => {
-      setState({ kind: 'error', message: refusalMessage(e) })
+    onMutate: () => {
+      originRef.current = store.getState().chat.activeSlot
+      setOutcome({ pending: true, failure: null, imported: null })
+      if (mountedRef.current) setState({ kind: 'importing' })
     },
+    onSuccess: async (r) => {
+      if (mountedRef.current) setState({ kind: 'done', title: r.title })
+      // The slot list first, so the switch lands on a row the sidebar knows.
+      await dispatch(fetchSlots())
+      if (!opensImportHere() || store.getState().chat.activeSlot !== originRef.current) {
+        // Not opened for the user, so the shell names what landed instead.
+        if (!mountedRef.current) setOutcome({ imported: r.title })
+        return
+      }
+      dispatch(switchSlot({ key: r.key, announceOnMissing: true }))
+    },
+    onError: (e) => {
+      const message = refusalMessage(e)
+      if (mountedRef.current) setState({ kind: 'error', message })
+      else setOutcome({ failure: message })
+    },
+    onSettled: () => { setOutcome({ pending: false }) },
   })
 
   return (
     <>
       <Item
-        disabled={state.kind === 'importing'}
+        disabled={pending}
         onSelect={(event: Event) => {
-          // Keep the menu open so the row can report the outcome.
           event.preventDefault()
-          inputRef.current?.click()
+          pickSessionFile((file) => { importMutation.mutate(file) })
         }}
       >
         <Upload size={13} className="shrink-0 text-muted" />
@@ -117,27 +287,7 @@ export default function ImportSessionItem({ Item }: ImportSessionItemProps) {
         <span className="grow truncate">
           {i18nT('components.importSessionItem.import_from_file')}
         </span>
-        {/* Off-screen rather than `display:none`: a hidden input is still the
-            accessible file control, and `.click()` on a display-none element is
-            ignored by some engines. `accept` is a HINT for the picker's default
-            filter only -- the endpoint sniffs the bytes, so a user who renamed
-            or unpacked the file is not locked out by it. */}
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".gz,.json,application/gzip,application/json"
-          className="sr-only"
-          aria-label={i18nT('components.importSessionItem.import_from_file')}
-          onClick={(e) => e.stopPropagation()}
-          onChange={(e) => {
-            const file = e.target.files?.[0]
-            // Reset so choosing the SAME file twice fires change twice; without
-            // it the second import silently does nothing.
-            e.target.value = ''
-            if (file) importMutation.mutate(file)
-          }}
-        />
-        {state.kind === 'importing' && (
+        {pending && (
           <Loader2 size={13} className="ml-auto shrink-0 animate-spin text-muted" />
         )}
         {state.kind === 'done' && (
