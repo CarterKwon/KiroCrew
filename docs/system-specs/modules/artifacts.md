@@ -104,7 +104,9 @@ navigation before rendering. It inspects actual attributes irrespective of SVG
 namespace and keeps only fragment hrefs; empty hrefs are navigation too.
 Models freely design supported HTML/CSS/SVG layouts and native
 disclosures; dynamic evidence arrives through published revisions, not model
-JavaScript. Deny-by-default CSP permits only inline styling and data images/fonts.
+JavaScript. Deny-by-default CSP permits only inline styling and data fonts; no
+image loads, since an image is bytes the browser decodes for display and the
+backend text scan cannot read them, so image-source attributes are removed too.
 The page receives no credentials or host state. Model-authored status is labeled a
 published view; it never replaces the host's trusted approval inventory.
 Automatic card data binds through `data-dashboard-field` text containers using

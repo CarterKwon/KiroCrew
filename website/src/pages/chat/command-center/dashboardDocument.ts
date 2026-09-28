@@ -81,11 +81,17 @@ export function dashboardDocument(html: string, themeVars: Record<string, string
     // namespaced xlink:href. Empty href also navigates (reloads the document).
     for (const attr of Array.from(element.attributes)) {
       if (attr.localName === 'href' && !attr.value.startsWith('#')) element.removeAttributeNode(attr)
+      // The markup comes from a model reading an untrusted transcript, and the
+      // backend scans it as text. A data: image is bytes the browser decodes
+      // for display, which the text scan cannot read the same way
+      // (percent-encoding, base64). Both surfaces are layout over text; inline
+      // SVG stays authorable, an image load is not.
+      if (attr.localName === 'src' || attr.localName === 'srcset') element.removeAttributeNode(attr)
     }
   }
   const csp = doc.createElement('meta')
   csp.httpEquiv = 'Content-Security-Policy'
-  csp.content = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none';"
+  csp.content = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none';"
   doc.head.prepend(csp)
   const style = doc.createElement('style')
   // readThemeVars already sanitizes the host's computed CSS values.

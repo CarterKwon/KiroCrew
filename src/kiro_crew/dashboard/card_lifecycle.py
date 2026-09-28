@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from html import unescape
 from typing import Any
 
@@ -19,6 +20,7 @@ from kiro_crew.dashboard.dynamic_cards import (
 from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.redaction import redact_credentials_with_records
 
 _PROMPT = """Create this session's concise status card, in the user's language.
 Explain what was done, what the evidence means, and what comes next. The supplied
@@ -44,6 +46,51 @@ def _redact(text: str) -> str:
     return redact_credentials(redact_exfiltration_urls(text)[0])[0]
 
 
+_TAG = re.compile(r"<[^>]*>")
+
+
+def _html_texts(markup: str) -> tuple[str, str]:
+    """The texts a browser can show for ``markup``, references decoded.
+
+    The credential catalogue's labelled rules match a label, a separator and a value
+    as one run of text. Markup can hold that run apart -- ``<b>key:</b> <code>value</code>``
+    -- so a scan of the raw markup sees the tag as the value and leaves the real one
+    in place. Scanning a projection gives markup the coverage plain text has.
+
+    Whether a tag boundary reads as a space or as nothing depends on the element: a
+    block boundary separates words, an inline boundary joins them, so
+    ``<span>AKIA</span><span>...</span>`` shows one token. The scanner does not lay
+    the page out, so both readings are returned and each is scanned.
+    """
+    return unescape(_TAG.sub(" ", markup)), unescape(_TAG.sub("", markup))
+
+
+def _hides_secret(text: str) -> bool:
+    """Whether markup in ``text`` keeps something from the raw scan that a browser shows.
+
+    For each projection, what the browser shows after the raw scan is the projection
+    of the redacted markup. Two things may be left in it that the raw scan should
+    have removed: a value the catalogue finds in the projection of the original --
+    held apart from its label by a tag, which the scan took for the value, or spelt
+    with a character reference -- and anything the scan itself still redacts when run
+    over that shown text, which is how a token or URL cut by an inline tag reads once
+    joined. Either means markup kept the raw scan from something the browser shows,
+    and the caller refuses the text rather than rewrite markup it cannot place the
+    value in.
+
+    Over-redaction is not judged here: a scan that removed more than the projection
+    shows leaked nothing, and the caller redacts as usual.
+    """
+    redacted = _redact(text)
+    for projected, shown in zip(_html_texts(text), _html_texts(redacted)):
+        if _redact(shown) != shown:
+            return True
+        _, _, matches = redact_credentials_with_records(projected)
+        if any(m.value.strip("\"' ") and m.value.strip("\"' ") in shown for m in matches):
+            return True
+    return False
+
+
 def _redact_card_output(text: str, previous: dict | None) -> dict | None:
     # JSON escapes are representation, not content. Scan the decoded strings
     # that can actually be published; the schema accepts no nested data.
@@ -64,6 +111,13 @@ def _redact_card_output(text: str, previous: dict | None) -> dict | None:
     clean: dict[str, Any] = {"data": data}
     if "html" in raw:
         if not isinstance(raw["html"], str):
+            return None
+        # Judged on the markup as returned: the raw scan can take a tag for the
+        # value of a labelled credential and redact the label alone, and the text
+        # projection of that result has lost the label that names the value. The
+        # field data is bound as text and holds no markup, so only the layout
+        # needs this.
+        if _hides_secret(raw["html"]):
             return None
         clean["html"] = _redact(raw["html"])
     payload = normalize_card(clean, previous)
@@ -234,6 +288,13 @@ class CardLifecycle:
             # A huge tool result is omitted, not scanned or sliced through a
             # credential. The source window itself has a CPU/memory budget.
             if not isinstance(raw, str) or len(raw) > MAX_INPUT_CHARS:
+                continue
+            # A message whose markup holds a labelled credential apart from its
+            # label is omitted whole, like an oversized one: the raw scan takes
+            # the tag for the value and leaves the real one in place, and the
+            # model must not see it. Judged before that scan, which would strip
+            # the label the projection needs.
+            if _hides_secret(raw):
                 continue
             text = _redact(raw)
             low, high = 0, min(len(text), remaining)

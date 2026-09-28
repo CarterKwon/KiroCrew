@@ -155,4 +155,20 @@ describe('task dashboard document isolation', () => {
     expect(doc.body.textContent).toContain('Private task')
     expect(html).not.toContain('outside.invalid')
   })
+
+  it('loads no image in either an automatic card or a saved view, keeping inline SVG', () => {
+    // A data: image is bytes the browser decodes for display. The backend scans
+    // the markup as text, so text that image would show is not text the scan
+    // can read; both surfaces are layout over text and need no image load.
+    const image = '<img src="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%3E%3Ctext%3EAKIA%3C%2Ftext%3E%3C%2Fsvg%3E" srcset="data:image/svg+xml,%3Csvg%2F%3E 2x">'
+    const html = `<p style="background-image:url(data:image/svg+xml,%3Csvg%2F%3E)">Board</p>${image}<svg><image href="data:image/svg+xml,%3Csvg%2F%3E"/><path d="M0 0L10 10"/></svg>`
+    for (const output of [dashboardDocument(html, {}, 'dark', {}), dashboardDocument(html, {}, 'dark')]) {
+      const doc = new DOMParser().parseFromString(output, 'text/html')
+      const policy = doc.head.firstElementChild?.getAttribute('content') || ''
+      expect(policy.match(/img-src ([^;]*);/)![1]).toBe("'none'")
+      expect(doc.querySelectorAll('[src], [srcset], [href]')).toHaveLength(0)
+      expect(doc.body.textContent).toContain('Board')
+      expect(doc.querySelector('svg path')?.getAttribute('d')).toBe('M0 0L10 10')
+    }
+  })
 })

@@ -1597,7 +1597,9 @@ generation events are accepted only from the currently registered slot object.
 Scratch edit/rewind copies sharing the current identity cannot clear its card or
 queue generation. A retired owner's callback clears only a card still owned by
 that retired identity, never the replacement's card, including when cancellation
-finishes after same-key recreation. Committed transcript rewrites remain subject
+finishes after same-key recreation. The close's own removal push evicts a card
+whose owner is not the live slot's identity, so a replacement registered before
+that push never presents its predecessor's card. Committed transcript rewrites remain subject
 to source-generation validation.
 Host slot/workflow/question/approval events continue to own runtime state immediately;
 turn completion is not evidence that the whole task succeeded.
