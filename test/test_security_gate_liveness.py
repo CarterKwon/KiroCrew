@@ -75,18 +75,42 @@ def _url_payload_command(n: int) -> str:
 #: to stop retrying and what to use instead.
 #:
 #: Raised again, from 27,766, for the case-aware substitution-depth walker
-#: (``_SubstitutionDepth`` and ``_reduce_expansions``, ~300 lines) that every
-#: argv window bounds itself with in place of the bare paren counter -- its glued
-#: segments fed in a loop rather than by recursion, so a long clause run cannot
-#: raise out of the gate; its ``grammar_next`` tells the ssh-family walk that a case
-#: WORD, ``in`` or PATTERN is not an operand (a ``*)`` pattern read as every self host).
+#: (``_SubstitutionDepth`` over a stack of ``_Frame`` command lists, ~380 lines) that
+#: every argv window bounds itself with in place of the bare paren counter -- one
+#: character pass per token, no recursion, so a long clause run cannot raise out of
+#: the gate; a substitution inside a ``case`` pattern is a frame of its own, so a
+#: nested case's ``)`` closes nothing of the enclosing one; its ``grammar_next`` tells
+#: the ssh-family walk that a case WORD, ``in`` or PATTERN is not an operand (a ``*)``
+#: pattern read as every self host).  Its ``words`` lists the top-level argument
+#: words a token completed with the substitutions cut out (the verb glued to a
+#: closer, ``esac)<verb>``), and a DATA token (a redirection) opens a substitution
+#: the window then reads through without ending it.
+#:
+#: Raised again, from 28,215, for the walker's lookahead: ``esac)`` in PATTERN
+#: position is either the reserved word glued to the substitution's closer or a
+#: quoted ``'esac')`` pattern with a clause body, and the rest of the argv settles it
+#: (a ``)`` closing nothing, a ``;;`` with no case or ``esac`` in command position is
+#: not valid bash under the closer reading).  One lookahead covers every ambiguity
+#: up to the event it finds, so the pass stays linear.  The ssh-family walk reads a
+#: substitution's body words as that command's argv, not its own operands.
+#:
+#: Raised again, from 28,348, for the quoted-grammar-word mark: bash reads ``case``,
+#: ``esac``, ``in`` and the keepers as grammar only when no character is quoted, and
+#: the tokenizer drops the quotes, so ``_self_tokens`` marks a quoted spelling from
+#: the raw text (one quote-state pass) and the walker reads an argument -- a
+#: ``$("case" x in y) <host>`` closes at its ``)`` and the host is this command's.
+#:
+#: Raised again, from 28,457, for the ssh-family walk reading the TOP-LEVEL words a
+#: token completes even when the token is grammar or a whole top-level word: the
+#: host glued behind a substitution's closer (``esac)<host>``, ``$(true)<host>``) is
+#: the destination when the output is empty.
 #:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 28_070
+_PACKAGE_LINE_BUDGET = 28_479
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
