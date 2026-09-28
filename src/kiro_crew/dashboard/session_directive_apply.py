@@ -1456,7 +1456,7 @@ async def _stop_resolved_loop(
                 )
             if await _is_owner_armed_member_loop(None, current, slot=slot) is not False:
                 return await _stop_owner_armed_member_loop(svc, loop_id, loop_slot_key, reason)
-            await svc.remove(loop_id)
+            await svc.remove(loop_id, stop_reason=AUTONUDGE_STOP_REASON, stop_detail=reason)
     else:
         # The removal leaves no row, so the agent's own reason travels in the WARNING
         # stop line instead (autonudge_stop_log); without it a self-stop is "removed".

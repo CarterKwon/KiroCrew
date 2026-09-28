@@ -3402,6 +3402,10 @@ restores the exact prior grant when the prior row remains. Request cancellation
 is retained while provider preparation, the replacement snapshot, exact
 credential activation, and owner-fence finalization (or exact rollback) are
 joined, and propagates only after `_deferred_monitor_replacements` is consumed.
+Once a replacement snapshot is durable and its timer is armed, an owner-fence
+finalization conflict or I/O failure is logged rather than turning the committed
+add into a false failure; the fence admits nobody, post-commit cleanup and events
+still run, and startup recovery resolves it from the accepted durable rows.
 Self-arm admission keeps its existing post-commit cleanup contract. Semantics: ON with no loop arms
 `max_cycles=0`/`max_runtime_secs=0` (unlimited — the owner's deliberate
 choice; every finite loop armed elsewhere keeps its caps), default
@@ -3448,15 +3452,30 @@ nothing on these two paths and keep their single read of the loop (there is
 no owner party to race, so nothing to re-read for); the nudge service's own
 locks still guard its bookkeeping, and the takeover's rollback still targets
 exactly the loop id and token it captured. The roster reads ON only when an
-active loop also has a valid sealed self or owner entry; a retired, quarantined
-or key-rotated record reads OFF instead of promising wakes the fire guard will
-refuse. On the Crewmates page, explicit roster `perpetual: off` wins over a
+active UNCAPPED loop (`max_cycles == 0` and `max_runtime_secs == 0`) also has a
+valid sealed owner entry; a retired, quarantined or key-rotated record reads OFF
+instead of promising wakes the fire guard will refuse. An active self-arm reads
+NONE so the ON route can take owner admission. An active loop still carrying
+either cap also reads NONE, decided before its arm party is consulted: a finite
+loop is a monitor, not Perpetual mode, so the switch stays available and the ON
+route takes it over rather than reporting a mode the loop is not in.
+The detail page's `crew-perpetual-status` card is one persistent, stable-height
+container. React atomically replaces its single keyed ON/OFF content layer, then
+fades the incoming content from partial to full opacity. The old and new verdicts
+are never mounted together, and opacity never reaches zero, so the status box
+shows neither a mixed state nor an empty frame during a change.
+The frontend uses the repeating-task reason only when the roster reads NONE and
+the registry row carries the subject-free `record_kind: "structured_monitor"`
+marker. A full self-arm or capped loop may also read NONE, but it carries no
+marker and is never mislabeled as a structured monitor.
+On the Crewmates page, explicit roster `perpetual: off` wins over a
 stale active registry row for the badge, status filter and Work log block; only
 an absent field uses the legacy registry fallback. ON on an active finite
 self-arm emits the same critical `autonudge_start` audit-or-deny event as a new
 owner arm, records the owner party, and clears both caps. An unlimited self-arm
-stays self-owned. A missing admission is repaired, and a finite owner arm has
-both caps cleared through the audited update path. The token-keyed prior party
+also becomes owner-controlled but needs no cap update. A missing admission is
+repaired, and a finite owner arm has both caps cleared through the audited
+update path. The token-keyed prior party
 is restored if the update fails or cancellation settles without both caps at
 zero. ON on a STOPPED legacy loop is an
 owner TAKEOVER (`_takeover_stopped_loop`): the entry's
@@ -3476,10 +3495,13 @@ read-modify-write in the trust module (`restore_arm_party_if_token`, siblings
 preserved verbatim), awaited inside the slot lock so the lock is released only
 after the restore ran. The pending takeover commits only after that uncapped
 row is durable. If the commit loses its token or its record write raises, the
-same audited update path pauses the loop before the route returns 503; if even
-that pause fails, the still-pending fence admits nobody at fire time and startup
-recovery resolves it from the durable loop row. The same fail-closed settlement
-applies to an active-loop takeover. A cancellation of the task itself
+same audited update path pauses the loop before the route returns 503. After an
+I/O failure, a successful pause runs token-scoped in-process recovery for that
+ONE fence using the same accepted-row verdict as startup: the paused row restores
+the prior party, and sibling fences stay untouched. If the pause or that recovery
+fails, the still-pending fence admits nobody at fire time and startup recovery
+resolves it from the durable loop row. The same fail-closed settlement applies
+to an active-loop takeover. A cancellation of the task itself
 (shutdown) has two shapes: during the joined owner-entry write, BEFORE the
 resume is issued, the outcome is certain (the loop is still stopped), so the
 entry is restored to its prior party (token-keyed, joined) and then the cancel
@@ -3570,14 +3592,17 @@ can turn it back on. The roster payload (`GET /api/members`) carries each
 member's `perpetual` reading (`on` / `off` / `none`, `perpetual_state_of`: an
 O(1) registry read per slot; a structured monitor and a never-opened thread
 both read `none`) so the roster and the team view can show a paused member
-without a second request. `on` means "a loop on this crewmate's own thread is
-active", NOT "uncapped": a finite loop the crewmate armed itself reads `on`
-while still scheduled to stop at its cap. ON pressed over that active finite
-self-arm records the owner party and clears both caps; the running turn stays
-untouched. The detail page's ON readout carries the loop's own wake
-count against its cap (`patrol_cycles_of`), which is where the coming stop
-shows; when that loop stops, the reading turns `off` with the cap reason and
-the owner's ON then lifts the caps. On a member slot the
+without a second request. `on` means "an UNCAPPED loop on this crewmate's own
+thread is active and admitted": a finite loop the crewmate armed itself
+(`max_cycles > 0` or `max_runtime_secs > 0`) reads `none` while it is active,
+because it is a monitor scheduled to stop at its cap, not Perpetual mode — and
+that answer is decided before the arm party is read, so a capped row costs no
+trust lookup. ON pressed over that active finite self-arm records the owner
+party and clears both caps; the running turn stays untouched. The detail
+page's ON readout carries the loop's wake count so far (`patrol_cycles_of`,
+shown as "Checks so far"); when a finite loop stops, the reading turns `off`
+with the cap reason and the owner's ON then resumes it and lifts the caps. On a
+member slot the
 applier's owner-arm read is tri-state and FAILS CLOSED: an unreadable or
 malformed record refuses the cap change and takes the retain-record stop
 path; non-member slots never reach the read.

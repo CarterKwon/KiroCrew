@@ -956,6 +956,70 @@ def rollback_owner_arm_revocation(revocation: OwnerArmRevocation) -> bool:
         return True
 
 
+def _resolved_owner_arm_fence(
+    loop_id: str,
+    entry: Any,
+    accepted: tuple[Any, ...] | None,
+) -> dict[str, Any] | None:
+    """Resolve one fenced entry from the loader's accepted durable row shape."""
+    marker = entry.get(_OWNER_REVOCATION_KEY) if isinstance(entry, dict) else None
+    if isinstance(marker, dict) and marker.get("action") == "grant":
+        token = marker.get("token")
+        if not isinstance(token, str):
+            raise OSError(f"pending owner admission for {loop_id} is malformed")
+        takeover = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), token)
+        matched = _matching_owner_takeover(entry, takeover)
+        if matched is None:
+            raise OSError(f"pending owner admission for {loop_id} is malformed")
+        prior, owner = matched
+        if accepted is None or accepted[0] != takeover.slot_key:
+            return None
+        if len(accepted) >= 5 and accepted[2:] == (True, 0, 0):
+            return owner
+        return prior
+    if not isinstance(marker, dict) or not isinstance(marker.get("token"), str):
+        raise OSError(f"owner admission revocation for {loop_id} is malformed")
+    revocation = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), marker["token"])
+    prior = _matching_owner_revocation(entry, revocation)
+    if prior is None:
+        raise OSError(f"owner admission revocation for {loop_id} is malformed")
+    expected_fingerprint = marker["loop_fingerprint"]
+    if (
+        accepted is not None
+        and len(accepted) >= 2
+        and accepted[:2] == (revocation.slot_key, expected_fingerprint)
+    ):
+        return prior
+    return None
+
+
+def recover_owner_arm_takeover(
+    takeover: OwnerArmRevocation,
+    accepted_loop_row: tuple[Any, ...] | None,
+) -> bool:
+    """Resolve this transaction's pending grant without touching sibling fences.
+
+    The accepted row uses the same slot/active/cap verdict as startup recovery.
+    The takeover token keeps a later transaction safe from this recovery pass.
+    """
+    with _record_lock() as dir_fd:
+        entries = _read_record_strict_raw(dir_fd)
+        entry = entries.get(takeover.loop_id)
+        if _matching_owner_takeover(entry, takeover) is None:
+            return False
+        resolved = _resolved_owner_arm_fence(
+            takeover.loop_id,
+            entry,
+            accepted_loop_row,
+        )
+        if resolved is None:
+            del entries[takeover.loop_id]
+        else:
+            entries[takeover.loop_id] = resolved
+        _write_record(entries, dir_fd)
+        return True
+
+
 def recover_owner_arm_revocation(
     accepted_loop_rows: Mapping[str, tuple[Any, ...]],
 ) -> None:
@@ -998,42 +1062,9 @@ def recover_owner_arm_revocation(
         # with the record untouched, so no sibling's verdict lands without it.
         resolved: dict[str, dict[str, Any] | None] = {}
         for loop_id, entry in fenced:
-            marker = entry.get(_OWNER_REVOCATION_KEY)
-            if isinstance(marker, dict) and marker.get("action") == "grant":
-                token = marker.get("token")
-                if not isinstance(token, str):
-                    raise OSError(f"pending owner admission for {loop_id} is malformed")
-                takeover = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), token)
-                matched = _matching_owner_takeover(entry, takeover)
-                if matched is None:
-                    raise OSError(f"pending owner admission for {loop_id} is malformed")
-                prior, owner = matched
-                accepted = accepted_loop_rows.get(str(loop_id))
-                if accepted is None or accepted[0] != takeover.slot_key:
-                    resolved[str(loop_id)] = None
-                elif len(accepted) >= 5 and accepted[2:] == (True, 0, 0):
-                    resolved[str(loop_id)] = owner
-                else:
-                    resolved[str(loop_id)] = prior
-                continue
-            if not isinstance(marker, dict) or not isinstance(marker.get("token"), str):
-                raise OSError(f"owner admission revocation for {loop_id} is malformed")
-            revocation = OwnerArmRevocation(
-                str(loop_id), str(entry.get("slot_key", "")), marker["token"]
+            resolved[str(loop_id)] = _resolved_owner_arm_fence(
+                str(loop_id), entry, accepted_loop_rows.get(str(loop_id))
             )
-            prior = _matching_owner_revocation(entry, revocation)
-            if prior is None:
-                raise OSError(f"owner admission revocation for {loop_id} is malformed")
-            accepted = accepted_loop_rows.get(str(loop_id))
-            expected_fingerprint = marker["loop_fingerprint"]
-            if (
-                accepted is not None
-                and len(accepted) >= 2
-                and accepted[:2] == (revocation.slot_key, expected_fingerprint)
-            ):
-                resolved[str(loop_id)] = prior
-            else:
-                resolved[str(loop_id)] = None
         for loop_id, prior in resolved.items():
             if prior is None:
                 del entries[loop_id]

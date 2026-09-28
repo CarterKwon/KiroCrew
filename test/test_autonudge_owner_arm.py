@@ -2034,7 +2034,7 @@ class TestPerpetualRoute:
         assert members_audit[0]["tool_name"] == "autonudge_start"
 
     @pytest.mark.asyncio
-    async def test_on_leaves_an_active_unlimited_self_arm_self_owned(
+    async def test_on_takes_over_an_active_unlimited_self_arm(
         self,
         quiet_authz_audit: list[dict[str, Any]],
         members_audit: list[dict[str, Any]],
@@ -2062,8 +2062,9 @@ class TestPerpetualRoute:
                 await resp.read()
         assert resp.status == 200
         assert svc.updates == [] and svc.added == []
-        assert sa.is_recorded_self_arm(unlimited.id, unlimited.slot_key) is True
-        assert members_audit == []
+        assert sa.is_recorded_owner_arm(unlimited.id, unlimited.slot_key) is True
+        assert sa.is_recorded_self_arm(unlimited.id, unlimited.slot_key) is False
+        assert members_audit[0]["tool_name"] == "autonudge_start"
 
     @pytest.mark.asyncio
     async def test_failed_active_self_takeover_restores_the_self_party(
@@ -2834,16 +2835,16 @@ class TestMemberDirectivesOnPerpetualLoop:
         loop = self._loop(self_armed=True)
         sa.record_self_arm(loop.id, loop.slot_key)
         svc = FakeLoopSvc(loop)
-        removed: list[str] = []
+        removed: list[tuple[str, str, str]] = []
 
         async def _remove(loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
-            removed.append(loop_id)
+            removed.append((loop_id, stop_reason, stop_detail))
 
         svc.remove = _remove  # type: ignore[attr-defined]
         slot = SimpleNamespace(mode="member", _app="")
         with patch("kiro_crew.autonudge.get_instance", return_value=svc):
-            await sda._autonudge_stop(slot, "dashboard:member-scout", {})
-        assert removed == [loop.id]
+            await sda._autonudge_stop(slot, "dashboard:member-scout", {"reason": "done"})
+        assert removed == [(loop.id, sda.AUTONUDGE_STOP_REASON, "done")]
 
 
 # ── (f) ownership checks, takeover, fail-closed reads, stop detail ──────────
@@ -3449,6 +3450,8 @@ class TestTakeoverTransaction:
         loop.active = True
         sa.record_self_arm(loop.id, loop.slot_key)
         svc = FakeLoopSvc(loop)
+        sibling = sa.begin_owner_arm_takeover("sib00061", "member-other", "")
+        real_settle = sa.settle_owner_arm_takeover
 
         def _raise(*_args: Any, **_kwargs: Any) -> bool:
             raise OSError("record unavailable")
@@ -3465,7 +3468,10 @@ class TestTakeoverTransaction:
         assert loop.active is False
         assert loop.max_cycles == 0 and loop.max_runtime_secs == 0
         assert [update.get("active") for update in svc.updates] == [True, False]
-        assert sa.read_arm_party_strict(loop.id, loop.slot_key) == ""
+        assert sa.read_arm_party_strict(loop.id, loop.slot_key) == "self"
+        assert sa.read_arm_party_strict(sibling.loop_id, sibling.slot_key) == ""
+        assert real_settle(sibling, commit=False) is True
+        assert sa.read_arm_party_strict(sibling.loop_id, sibling.slot_key) == ""
 
     @pytest.mark.asyncio
     async def test_critical_audit_failure_leaves_prior_party_and_loop_unchanged(
@@ -4351,6 +4357,58 @@ class TestOwnerArmRemovalBoundary:
             assert persisted is not None and persisted.id == "replacement"
         finally:
             release.set()
+            svc.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["conflict", "oserror"])
+    async def test_durable_replacement_survives_owner_fence_finalize_failure(
+        self,
+        failure_kind: str,
+        trust_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: Any,
+    ) -> None:
+        from kiro_crew.autonudge import AutoNudgeService, MonitorUpdateConflict
+
+        prior = self._loop("rmown006")
+        sa.record_owner_arm(prior.id, prior.slot_key)
+        svc = self._service(tmp_path, prior, monkeypatch)
+        failure: Exception
+        if failure_kind == "conflict":
+            failure = MonitorUpdateConflict("owner admission changed")
+        else:
+            failure = OSError("record unavailable")
+
+        async def _fail_finalize(_revocation: Any) -> bool:
+            raise failure
+
+        monkeypatch.setattr(svc, "_commit_owner_revocation", _fail_finalize)
+        try:
+            with caplog.at_level(logging.ERROR, logger="kiro_crew.autonudge"):
+                replacement = await svc.add(
+                    prior.slot_key,
+                    "replacement",
+                    idle_secs=3600,
+                    max_cycles=0,
+                    stop_sentinel_path="",
+                    loop_id="replacement",
+                )
+
+            assert replacement.id == "replacement"
+            assert svc.get_by_slot(prior.slot_key) is replacement
+            assert prior.id not in svc._loops
+            assert any(
+                "committed but owner admission finalization" in record.message
+                for record in caplog.records
+            )
+
+            reloaded = AutoNudgeService(base_dir=tmp_path)
+            reloaded._load()
+            persisted = reloaded.get_by_slot(prior.slot_key)
+            assert persisted is not None and persisted.id == "replacement"
+            assert sa.read_arm_party_strict(prior.id, prior.slot_key) == ""
+        finally:
             svc.stop()
 
 
@@ -5700,12 +5758,19 @@ class TestRosterPerpetualReading:
     def _svc(loop: NudgeLoop | None) -> Any:
         return SimpleNamespace(get_by_slot=lambda slot_key: loop)
 
-    def test_admitted_active_loop_reads_on(self, trust_home: Path) -> None:
+    def test_owner_active_uncapped_loop_reads_on(self, trust_home: Path) -> None:
         from kiro_crew.dashboard.handlers.members import perpetual_state_of
 
         loop = NudgeLoop(id="ro000001", slot_key="member-scout", message="m", idle_secs=60)
-        sa.record_self_arm(loop.id, loop.slot_key)
+        sa.record_owner_arm(loop.id, loop.slot_key)
         assert perpetual_state_of(self._svc(loop), "member-scout") == "on"
+
+    def test_self_active_uncapped_loop_reads_none(self, trust_home: Path) -> None:
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(id="ro000009", slot_key="member-scout", message="m", idle_secs=60)
+        sa.record_self_arm(loop.id, loop.slot_key)
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
 
     def test_preloaded_parties_keep_roster_rows_in_memory(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5754,6 +5819,53 @@ class TestRosterPerpetualReading:
         loop = NudgeLoop(id="ro000004", slot_key="member-scout", message="m", idle_secs=60)
         with patch("kiro_crew.autonudge.is_structured_monitor_loop", return_value=True):
             assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
+
+    @pytest.mark.parametrize(
+        ("max_cycles", "max_runtime_secs"),
+        [(24, 0), (0, 3600), (24, 3600)],
+        ids=["cycle-cap", "runtime-cap", "both-caps"],
+    )
+    def test_active_capped_loop_reads_none_before_its_party(
+        self, monkeypatch: pytest.MonkeyPatch, max_cycles: int, max_runtime_secs: int
+    ) -> None:
+        """A finite loop is a monitor, not Perpetual mode: it reads ``none`` so the
+        switch stays available for the ON route to take over and clear both caps,
+        and the cap check runs BEFORE the arm party is consulted -- no trust-record
+        read happens for a capped row, whether preloaded or per-row."""
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(
+            id="ro000007",
+            slot_key="member-scout",
+            message="m",
+            idle_secs=60,
+            max_cycles=max_cycles,
+            max_runtime_secs=max_runtime_secs,
+        )
+
+        def _unexpected_read(loop_id: str, slot_key: str) -> str:
+            raise AssertionError("capped loop consulted its arm party")
+
+        monkeypatch.setattr(sa, "read_arm_party_strict", _unexpected_read)
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
+        admitted = {("ro000007", "member-scout"): "owner"}
+        assert perpetual_state_of(self._svc(loop), "member-scout", arm_parties=admitted) == "none"
+
+    def test_paused_capped_loop_still_reads_off(self) -> None:
+        """The cap rule is for ACTIVE loops only: a paused finite loop keeps its
+        ``off`` reading, because the ON route resumes THAT loop and lifts its caps."""
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(
+            id="ro000008",
+            slot_key="member-scout",
+            message="m",
+            idle_secs=60,
+            max_cycles=24,
+            active=False,
+            stopped_reason="manual",
+        )
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "off"
 
 
 # ── (h) the record's own masked leaf ────────────────────────────────────────

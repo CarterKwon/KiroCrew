@@ -232,6 +232,8 @@ export function useCrewPerpetual(
           : "none";
   // A record the roster does not count as the switch's loop (a structured
   // monitor's reduced row) carries no readouts worth showing under the switch.
+  // Its positive marker prevents full self-arm and capped rows that also read
+  // `none` from inheriting the structured monitor's stop advice.
   const loop = state === "none" ? undefined : record;
   const rosterLoaded = roster.data !== undefined || roster.isError;
   const loopsLoaded = loops.data !== undefined || loops.isError;
@@ -249,7 +251,7 @@ export function useCrewPerpetual(
     loaded: rosterLoaded && loopsLoaded,
     failed,
     missing: roster.data !== undefined && !row,
-    monitor: state === "none" && !!record,
+    monitor: state === "none" && record?.record_kind === "structured_monitor",
     enabled: loops.data === undefined || loops.data.enabled !== false,
   };
 }

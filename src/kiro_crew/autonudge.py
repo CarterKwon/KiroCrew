@@ -3421,10 +3421,23 @@ class AutoNudgeService:
                 raise
             self._arm_from_deadline(loop)
             if existing is not None:
-                transaction_cancelled = (
-                    await self._commit_owner_revocation(existing_owner_revocation)
-                    or transaction_cancelled
-                )
+                try:
+                    transaction_cancelled = (
+                        await self._commit_owner_revocation(existing_owner_revocation)
+                        or transaction_cancelled
+                    )
+                except (MonitorUpdateConflict, OSError):
+                    # The replacement row is already durable and its timer is armed.
+                    # Do not report that committed add as failed: the sealed fence
+                    # admits nobody, and startup recovery resolves it from the
+                    # durable rows that survived the restart.
+                    logger.error(
+                        "AutoNudge: replacement %s committed but owner admission "
+                        "finalization for displaced loop %s failed",
+                        loop.id,
+                        existing.id,
+                        exc_info=True,
+                    )
                 # Committed: the displaced row is gone from the store, so its
                 # self-arm entry is revoked now, not before the write.
                 self._revoke_self_arm_for(existing)
