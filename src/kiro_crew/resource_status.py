@@ -13,13 +13,16 @@ Shared by two advisory surfaces:
 
 The advisory surfaces carry no enforcement, no lease, no cross-session
 coordination. Two sessions can both read "ample" and both launch heavy work —
-the tradeoff of a cheap, zero-tuning guard. One narrow enforcement point sits
-on top: :func:`admission_check` gates *background* work admission (scheduled
-cron firings, new subagent spawns) while posture is CRITICAL, so the scheduler
-stops piling work onto a host that is about to freeze. Direct user chat turns
-and the gateway's own operation are never gated, and the gate fails open on an
-unknown posture. (A hard, cross-session admission lease is a separate, heavier
-design.)
+the tradeoff of a cheap, zero-tuning guard. Two narrow enforcement points sit
+on top, both behind ``agent.admission_gate``: :func:`admission_check` gates
+*background* work admission (scheduled cron firings, new subagent spawns) while
+posture is CRITICAL, so the scheduler stops piling work onto a host that is
+about to freeze; and :func:`hold_heavy_command` holds a running subagent's
+automatically granted heavy shell command (a test run, a build) for a bounded
+time while posture is CRITICAL, so a burst of heavy runs does not land at once.
+Direct user chat turns and the gateway's own operation are never gated, and
+both points fail open on an unknown posture. (A hard, cross-session admission
+lease is a separate, heavier design.)
 
 The memory figure reuses :func:`kiro_crew.subagent._available_memory_gb`, the
 same cgroup-clamped, container-aware probe that auto-sizes the sub-agent cap, so
@@ -39,17 +42,20 @@ posture stays a single memory scalar, so :func:`admission_check` and
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, MutableMapping
+from collections.abc import Awaitable, Callable, Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.cpu_affinity import affinity_cpu_count
+from kiro_crew.trust_patterns import split_command_segments
 
 logger = logging.getLogger(__name__)
 
@@ -963,3 +969,166 @@ def cached_admission_check() -> AdmissionDecision:
         available_gb=-1.0,
         reason="no cached verdict yet — admitting (fail-open)",
     )
+
+
+# ── heavy-command hold ───────────────────────────────────────────────────────
+#
+# A sub-agent START is cheap; the work it runs later is what can exhaust a
+# host -- a test suite or a build several agents launch at once. So the spawn
+# guard prices a start at its configured start cost, and heavy work is held
+# HERE, at the command, while memory is critically low. Holding a command
+# means not answering its permission request yet: the agent simply waits, and
+# the command runs once memory frees or the hold's bound runs out. The hold
+# fails open (an unknown posture, or the bound) because a stalled agent is
+# worse than a slow host.
+
+#: Longest a heavy command is held, in seconds, before it runs anyway. Kept
+#: a real margin under the ~300 s the runtime waits for an unanswered
+#: permission request: a hold IS an unanswered request, so a bound equal to
+#: that patience could let the runtime give up on the request the hold was
+#: about to grant.
+HEAVY_COMMAND_HOLD_SECS = 240.0
+#: How often a held command re-reads the host posture, in seconds.
+HEAVY_COMMAND_POLL_SECS = 10.0
+
+#: Commands that typically claim gigabytes: test runners, builds, bundlers.
+#: Matched against the PROGRAM each pipeline segment runs (see
+#: :func:`is_heavy_command`), never against arguments or quoted text, so
+#: ``grep -rn pytest`` or a commit message that says "make" is not held.
+_HEAVY_COMMAND_RE = re.compile(
+    r"^(?:"
+    r"pytest|tox|nox|vitest|jest|tsc|webpack|gradlew?|mvn|bazel|make"
+    r"|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test)"
+    r"|cargo\s+(?:build|test|check|clippy)"
+    r"|go\s+(?:build|test)"
+    r"|vite\s+build"
+    r"|playwright\s+test"
+    r"|docker\s+(?:build|compose\s+up)"
+    r")(?:\s|$)"
+)
+
+#: Prefixes that only wrap the program that follows: ``VAR=val``, ``env``,
+#: ``nice``, ``timeout [opts] N``, ``sudo``. Stripped before matching.
+#: An assignment's value may be shell-quoted (``FOO="a b" pytest``), so the
+#: value consumes whole quoted parts, not just up to the first space. Each
+#: wrapper's own flags are consumed too, together with the value of a flag
+#: that takes one (``timeout -k 10``, ``sudo -u bob``, ``env -u VAR``,
+#: ``nice -n 10``), so the program judged is the one the wrapper runs:
+#: ``timeout -k 10 600 pytest`` is judged by ``pytest``, not by ``600``.
+#:
+#: Every repeated group has DISJOINT alternatives, so each character has one
+#: way to be matched and a non-matching line is refused in linear time. A
+#: value's unquoted characters exclude the quotes (``[^\s"']``), so a quote
+#: can only start a quoted part; a flag's separate value must start with a
+#: character that is not ``-`` (``-u VAR``), so an attached value (``-uVAR``)
+#: or a bare flag (``-i``) is only ever the plain-flag alternative.
+_WRAPPER_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s\"'])*"
+    r"|env(?:\s+-u\s+[^\s-]\S*|\s+-\S+)*"
+    r"|sudo(?:\s+-[ug]\s+[^\s-]\S*|\s+-\S+)*"
+    r"|nice(?:\s+-n\s+[^\s-]\S*|\s+-\S+)*"
+    r"|timeout(?:\s+-[ks]\s+[^\s-]\S*|\s+-\S+)*\s+\S+"
+    r")\s+"
+)
+#: Launchers whose real program is the argument: ``python -m pytest``,
+#: ``npx vitest``. Stripped before matching so the tool name is what is judged.
+_LAUNCHER_RE = re.compile(
+    r"^(?:python(?:\d(?:\.\d+)?)?\s+-m|npx(?:\s+--?\S+)*|pnpm\s+exec|yarn\s+exec|bunx)\s+"
+)
+
+
+def _split_commands(command: str) -> list[str]:
+    """Split *command* where one command ends and the next begins.
+
+    Reuses the approval path's quote- and redirect-aware splitter
+    (:func:`kiro_crew.trust_patterns.split_command_segments`): ``;``, ``&&``,
+    ``&``, ``||``, ``|`` and newlines separate outside quotes, while ``2>&1``
+    and ``&>log`` do not. A line that splitter refuses to judge (a command
+    substitution) is judged whole.
+    """
+    split = split_command_segments(command, mask_escaped=True)
+    return [command] if split is None else split[1]
+
+
+def _program_of(segment: str) -> str:
+    """The program a pipeline *segment* runs, wrappers and launchers stripped."""
+    text = " ".join(segment.split())
+    while True:
+        stripped = _WRAPPER_RE.sub("", text, count=1)
+        # Drop the leading path of the program (``.venv/bin/python``, ``./gradlew``).
+        first, sep, rest = stripped.partition(" ")
+        stripped = _LAUNCHER_RE.sub("", f"{first.rsplit('/', 1)[-1]}{sep}{rest}", count=1)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+def is_heavy_command(command: str | None) -> bool:
+    """True when *command* looks like a test run or build that claims gigabytes.
+
+    Judged by the program each segment runs, not by the words anywhere on the
+    line: ``cd website && npm run build`` and ``.venv/bin/python -m pytest``
+    are heavy; ``grep -rn pytest test/`` and ``git commit -m "make it green"``
+    are not, and neither is ``git commit -m "fix: pytest hangs; make it
+    bounded"``, whose separators sit inside a quoted argument.
+    """
+    if not command:
+        return False
+    return any(
+        _HEAVY_COMMAND_RE.search(_program_of(segment)) for segment in _split_commands(command)
+    )
+
+
+async def hold_heavy_command(
+    command: str | None,
+    *,
+    hold_secs: float = HEAVY_COMMAND_HOLD_SECS,
+    poll_secs: float = HEAVY_COMMAND_POLL_SECS,
+    probe_fn: Callable[[], ResourceStatus] = probe,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    on_wait: Callable[[], Awaitable[object]] | None = None,
+    cfg: object | None = None,
+) -> float:
+    """Wait while the host is CRITICAL before a heavy *command* runs.
+
+    Returns the seconds held (``0.0`` when it never had to wait). Light commands,
+    a tight/ample/unknown posture and a disabled bound (``hold_secs <= 0``)
+    return at once, and so does a switched-off gate: ``agent.admission_gate:
+    false`` makes the critical posture advisory-only, and this hold is the same
+    enforcement :func:`admission_check` applies to a start, so it honours the
+    same switch. The probe runs off-loop; a probe that raises ends the hold,
+    since this is back-pressure and must never wedge an agent. *on_wait* runs
+    after each poll, so a caller can show the agent as alive rather than
+    stalled while it waits. *cfg* is an optional pre-loaded ``KiroCrewConfig``.
+    """
+    if hold_secs <= 0 or not is_heavy_command(command):
+        return 0.0
+    if cfg is None:
+        cfg = await asyncio.to_thread(_load_config)
+    if not _gate_enabled(cfg):
+        return 0.0
+    started = clock()
+    held = False
+    while True:
+        try:
+            status = await asyncio.to_thread(probe_fn)
+        except Exception:
+            logger.debug("heavy-command hold: probe failed; running now", exc_info=True)
+            break
+        if status.posture != POSTURE_CRITICAL:
+            break
+        waited = clock() - started
+        if waited >= hold_secs:
+            logger.warning(
+                "heavy-command hold: memory still critical after %.0fs (%.1f GB free); "
+                "running anyway",
+                waited,
+                status.available_gb,
+            )
+            break
+        await sleep(min(poll_secs, hold_secs - waited))
+        held = True
+        if on_wait is not None:
+            await on_wait()
+    return clock() - started if held else 0.0

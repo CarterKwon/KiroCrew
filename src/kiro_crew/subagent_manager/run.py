@@ -74,6 +74,7 @@ if TYPE_CHECKING:
         extract_options,
         failure_name,
         fire_tool_hooks,
+        hold_heavy_command,
         hook_gate_kwargs,
         identity_grant_covers_child,
         invalidate_stale_kas_session,
@@ -2002,6 +2003,49 @@ class RunEventCoordinator(ManagerComponent):
                     await asyncio.sleep(delay)
                     msg = _TRANSIENT_CONTINUE_MSG if _had_activity else full_message
 
+        async def _grant(
+            client: Any,
+            request_id: str | int,
+            session_key: str,
+            event: LLMEvent,
+            *,
+            metadata: dict | None = None,
+            info: SubagentInfo,
+            hold: bool = True,
+        ) -> None:
+            """Approve a permission request, holding a heavy shell command first.
+
+            Heavy work (a test suite, a build) waits here while host memory is
+            critically low: the start was priced cheap on purpose, so this is
+            where a burst of heavy runs is kept from piling up. The hold sits
+            on the GRANT, after every deny/reject branch, so a request that is
+            refused never waits. It applies to AUTOMATIC grants only (trust
+            patterns, hook auto-approve, ``parent_policy=auto``): a caller
+            passes ``hold=False`` when the grant follows an interactive human
+            approval, because the human who just approved is present and has
+            priced the run, and because the human's own deliberation time plus
+            a hold of up to ``HEAVY_COMMAND_HOLD_SECS`` could outlast the
+            runtime's patience for an unanswered request. Bounded and
+            fail-open; see ``hold_heavy_command``. The hold runs inside this
+            run's own ``asyncio.wait_for`` budget (``_default_timeout``,
+            legally as low as 60 s), so its bound is capped at a quarter of
+            that budget: a full 240 s hold must not spend a short run's whole
+            allowance waiting for memory.
+            """
+            if hold and getattr(event, "is_shell", False):
+                from kiro_crew.resource_status import HEAVY_COMMAND_HOLD_SECS
+
+                held = await hold_heavy_command(
+                    getattr(event, "shell_command", None),
+                    hold_secs=min(HEAVY_COMMAND_HOLD_SECS, self._manager._default_timeout / 4),
+                    on_wait=lambda: self._manager._touch_activity(info),
+                )
+                if held > 0:
+                    logger.info("Subagent %s: held a heavy command %.0fs for memory", info.id, held)
+            await self._manager._approve_and_log(
+                client, request_id, session_key, event, metadata=metadata, info=info
+            )
+
         _complete_event: LLMEvent | None = None
         # Wall clock for THIS subagent's own turn. Deliberately started here,
         # at the subagent's own stream, not on the parent side: under session
@@ -2229,7 +2273,7 @@ class RunEventCoordinator(ManagerComponent):
                     # grant instead of stalling a trusted fan-out on an
                     # interactive card per call.
                     if parent_policy == "auto" and event.child_unconditional_grant_eligible:
-                        await self._manager._approve_and_log(
+                        await _grant(
                             client,
                             event.request_id,
                             session_key,
@@ -2255,7 +2299,7 @@ class RunEventCoordinator(ManagerComponent):
                     # Every other hook auto-approve (title, payload kind, command)
                     # stays fail-closed below for a low-fidelity child.
                     if identity_grant_covers_child(tool_result, event):
-                        await self._manager._approve_and_log(
+                        await _grant(
                             client,
                             event.request_id,
                             session_key,
@@ -2315,7 +2359,7 @@ class RunEventCoordinator(ManagerComponent):
                             info._awaiting_approval = False
                             info.last_activity = time.time()
                         if approved:
-                            await self._manager._approve_and_log(
+                            await _grant(
                                 client,
                                 event.request_id,
                                 session_key,
@@ -2325,6 +2369,7 @@ class RunEventCoordinator(ManagerComponent):
                                     "reason": "child_interactive_approved",
                                 },
                                 info=info,
+                                hold=False,
                             )
                         else:
                             await self._manager._reject_and_log(
@@ -2356,7 +2401,7 @@ class RunEventCoordinator(ManagerComponent):
                     # not the rarer one.
                     _ng_refusal = await name_grant.refusal_for_event(event)
                     if _ng_refusal is None:
-                        await self._manager._approve_and_log(
+                        await _grant(
                             client,
                             event.request_id,
                             session_key,
@@ -2380,7 +2425,7 @@ class RunEventCoordinator(ManagerComponent):
                         sel_factory=sel,
                     )
                 if parent_policy == "auto":
-                    await self._manager._approve_and_log(
+                    await _grant(
                         client,
                         event.request_id,
                         session_key,
@@ -2406,13 +2451,14 @@ class RunEventCoordinator(ManagerComponent):
                             metadata={"subagent_id": info.id, "reason": "factory_rejected"},
                         )
                         continue
-                    await self._manager._approve_and_log(
+                    await _grant(
                         client,
                         event.request_id,
                         session_key,
                         event,
                         metadata={"subagent_id": info.id},
                         info=info,
+                        hold=False,
                     )
                 elif self._manager._on_tool_approval:
                     info._awaiting_approval = True
@@ -2428,13 +2474,14 @@ class RunEventCoordinator(ManagerComponent):
                             client, event.request_id, session_key, event
                         )
                         continue
-                    await self._manager._approve_and_log(
+                    await _grant(
                         client,
                         event.request_id,
                         session_key,
                         event,
                         metadata={"subagent_id": info.id},
                         info=info,
+                        hold=False,
                     )
                 else:
                     # No callback, no auto policy — deny by default

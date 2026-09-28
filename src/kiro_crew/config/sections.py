@@ -1194,10 +1194,13 @@ class AgentConfig:
             "While available memory is at or below resource_critical_gb, defer "
             "scheduled cron firings to the next tick and defer new subagent "
             "spawns (they stay queued in the task store and are re-checked "
-            "after admit_wait_secs) until memory frees. Manually triggered cron "
-            "runs, in-flight subagents, and direct chat turns are never gated; "
-            "an unreadable probe admits (fail-open). Set false to make the "
-            "critical posture advisory-only.",
+            "after admit_wait_secs) until memory frees, and hold a running "
+            "subagent's automatically granted heavy shell command (a test run "
+            "or build) for up to 240 s before it runs anyway. Manually "
+            "triggered cron runs, direct chat turns, and commands a human "
+            "approved are never gated; an unreadable probe admits (fail-open). "
+            "Set false to make the critical posture advisory-only, which also "
+            "switches off the hold.",
         ),
     )
     task_queue_enabled: bool = field(

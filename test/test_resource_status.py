@@ -7,6 +7,7 @@ disable switch, fail-open) and the ``resource_status`` pull tool wired into
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -664,3 +665,53 @@ class TestSliceOwnership:
             "readable": True,
             "healthy": False,
         }
+
+
+# ── heavy-command wrapper stripping: linear time ─────────────────────────────
+@pytest.mark.parametrize(
+    "command",
+    [
+        # An assignment whose value is thousands of empty quoted parts and no
+        # trailing space: the old value pattern let ``\S`` also eat a quote, so
+        # every ``""`` had two parses and refusing the line was exponential.
+        'A=' + '""' * 5000 + "!",
+        "A=" + "'x'" * 5000 + "!",
+        # Flag loops: a ``-uX`` token used to match both "flag with a value"
+        # and "plain flag"; ``timeout``'s trailing ``\s+\S+`` made the miss
+        # exponential, and the others carried the same ambiguity.
+        "env " + "-uX " * 5000 + "!",
+        "env" + " -uX" * 5000,
+        "sudo" + " -uX" * 5000,
+        "nice" + " -nX" * 5000,
+        "timeout" + " -kX" * 5000,
+        "timeout" + " -k X" * 5000,
+    ],
+)
+def test_wrapper_stripping_is_linear_on_adversarial_prefixes(command: str) -> None:
+    """The wrapper pattern's repeated groups have disjoint alternatives, so a
+    hostile ``VAR=`` value or a wall of wrapper flags is judged in well under a
+    second instead of hanging the permission path (CodeQL py/redos)."""
+    started = time.perf_counter()
+    rs.is_heavy_command(command)
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout -k 10 600 pytest",
+        "sudo -u bob make",
+        "env -i pytest",
+        "env -u VAR pytest",
+        "env -uVAR pytest",
+        "nice -n 10 pytest",
+        "nice -n -5 pytest",
+        'FOO="a b" pytest',
+        "FOO='a b'c pytest",
+    ],
+)
+def test_disjoint_wrapper_pattern_still_strips_every_wrapper(command: str) -> None:
+    """Making the alternatives disjoint changed no judgement: a flag's separate
+    value, an attached value, a bare flag and a quoted assignment value are
+    all still consumed so the program the wrapper runs is what is judged."""
+    assert rs.is_heavy_command(command)
