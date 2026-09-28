@@ -848,7 +848,9 @@ class TestOnEventDispatch:
         ) as dispatch:
             await on_event(_client(), _req("interactive", {"action": "x"}))
             await _drain(orch)
-        dispatch.assert_awaited_once_with({"action": "x"})
+        # The receipt generation rides along; this double's session map reports
+        # no integer generation, so the listener hands ``None`` down (unfenced).
+        dispatch.assert_awaited_once_with({"action": "x"}, links_generation=None)
 
     @pytest.mark.asyncio
     async def test_update_pause_refuses_before_interaction_ack(self):

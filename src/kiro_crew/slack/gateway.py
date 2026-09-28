@@ -58,6 +58,7 @@ from kiro_crew import (
 from kiro_crew.acp.client import AcpError, AcpProcessDied
 from kiro_crew.agent_sdk import AgentTurnUsage
 from kiro_crew.agents_janitor import sweep_agents_dir
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     MONITOR_TERMINAL_REASON,
@@ -337,6 +338,7 @@ from kiro_crew.session import (
     SessionManager,
 )
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.slack import affinity as slack_affinity
 from kiro_crew.slack.client import RealSlackClient
 from kiro_crew.slack.format import (
     build_cron_ack_block,
@@ -351,6 +353,8 @@ from kiro_crew.slack.handler import (
     is_thread_incognito,
     is_thread_temporary,
     is_tracked_channel,
+    set_allowed_users,
+    set_owner_id,
 )
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
@@ -1952,6 +1956,108 @@ def _push_observe_limits(history: ChannelHistory, max_entries: int, ttl_secs: in
     history._observe_ttl_secs = ttl_secs
 
 
+# The workspace the persisted Slack destinations belong to, beside the session
+# map they describe. ``SessionMap`` rows name a thread and a channel but no
+# workspace (the bot token was the only identity there was), so the identity is
+# recorded once, here, for all of them: it is what lets a boot -- not only a
+# reconnect -- tell that the credentials now on disk name ANOTHER workspace than
+# the one those destinations were written under, and sweep them before the new
+# client is published. Without it a restart between a workspace switch and its
+# sweep would re-seed the identity from the NEW workspace and keep every stale
+# row forever.
+SLACK_WORKSPACE_STATE_FILENAME = "slack_workspace.json"
+
+
+@dataclass(frozen=True)
+class _SlackWorkspaceRecord:
+    """What ``SLACK_WORKSPACE_STATE_FILENAME`` holds.
+
+    ``team_id`` is the workspace the persisted Slack destinations were written
+    under ("" when nothing was ever recorded). ``pending_team_id`` names a
+    workspace SWITCH that was started and not finished: it is written, with a
+    copy of the rows about to be swept in ``pending_swept``, BEFORE the sweep
+    reaches disk, and cleared by the write that adopts the new identity. A
+    process that dies in between leaves the marker, and the next connect
+    finishes the switch or -- when the credentials name the recorded
+    workspace again -- puts the swept rows back from the copy. Without the
+    marker that crash would have landed the sweep and kept the former
+    identity, and a return to the former workspace would find its mirrors
+    gone for good.
+    """
+
+    team_id: str
+    pending_team_id: str = ""
+    pending_swept: tuple[dict[str, object], ...] = ()
+
+
+def _load_slack_workspace_record(path: Path) -> _SlackWorkspaceRecord | None:
+    """The persisted workspace record.
+
+    ``team_id == ""`` with no pending switch when NO record exists (nothing
+    was ever recorded here); ``None`` when a record exists but cannot be read
+    or does not parse -- damaged, not absent. The two are kept apart because a
+    boot that took a damaged record for an absent one would adopt whatever
+    workspace the handshake names as if it were the first, and the switch
+    detection the record exists for would be silently skipped once;
+    ``_adopt_slack_workspace`` refuses on ``None``. A ``pending`` member that
+    is not an object carrying a string ``team_id`` and a list of row objects
+    is damage too: half a marker cannot be finished or undone.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _SlackWorkspaceRecord("")
+    except OSError:
+        return None
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return None
+    team_id = raw.get("team_id") if isinstance(raw, dict) else None
+    if not isinstance(team_id, str):
+        return None
+    pending = raw.get("pending")
+    if pending is None:
+        return _SlackWorkspaceRecord(team_id)
+    if not isinstance(pending, dict):
+        return None
+    pending_team = pending.get("team_id")
+    swept = pending.get("swept")
+    if not isinstance(pending_team, str) or not pending_team or not isinstance(swept, list):
+        return None
+    if not all(isinstance(row, dict) for row in swept):
+        return None
+    return _SlackWorkspaceRecord(team_id, pending_team, tuple(swept))
+
+
+def _load_slack_links_team_id(path: Path) -> str | None:
+    """The recorded workspace identity alone: "" for no record, ``None`` for a
+    damaged one (see :func:`_load_slack_workspace_record`)."""
+    record = _load_slack_workspace_record(path)
+    return None if record is None else record.team_id
+
+
+def _store_slack_links_team_id(
+    path: Path,
+    team_id: str,
+    *,
+    pending: tuple[str, list[dict[str, object]]] | None = None,
+) -> None:
+    """Record *team_id* as the workspace the persisted Slack destinations name.
+
+    With *pending* -- ``(new_team_id, rows_about_to_be_swept)`` -- the record
+    also carries the switch marker described on :class:`_SlackWorkspaceRecord`;
+    without it, any earlier marker is dropped, which is what finishes a switch.
+    Atomic (temp file + rename) so a crash mid-write leaves the previous
+    record, never a torn one; a torn record would read as "unknown" and
+    disable the switch detection it exists for.
+    """
+    document: dict[str, object] = {"team_id": team_id}
+    if pending is not None:
+        document["pending"] = {"team_id": pending[0], "swept": list(pending[1])}
+    atomic_write(path, json.dumps(document), fsync=True)
+
+
 class GatewayOrchestrator:
     """Manages the lifecycle of all gateway services.
 
@@ -2048,7 +2154,10 @@ class GatewayOrchestrator:
         self._register_config_appliers()
 
         # Services (initialized in start())
-        self.slack: RealSlackClient | None = None
+        # The LIVE Web API client; read through the ``slack`` property, which
+        # answers with the client bound to the current envelope's context when
+        # there is one (``slack.affinity``).
+        self._slack_live: RealSlackClient | None = None
         self.sessions: SessionManager | None = None
         self.ctx_builder: ContextBuilder | None = None
         self.conv_log: ConversationLog | None = None
@@ -2119,6 +2228,38 @@ class GatewayOrchestrator:
         # not race two Socket Mode handshakes against one client slot).
         self._slack_seen: SeenCache | None = None
         self._slack_reconnect_task: asyncio.Task[dict[str, object]] | None = None
+        # The ``auth.test`` team_id of the workspace the LAST published Slack
+        # client belonged to -- the workspace every Slack destination persisted
+        # since then names implicitly. Boot and ``reconnect_slack`` compare it
+        # with the workspace they just validated and sweep those destinations
+        # on a switch (``_adopt_slack_workspace``). Persisted beside the session
+        # map (``SLACK_WORKSPACE_STATE_FILENAME``) so the comparison survives a
+        # restart; "" when no socket has ever validated a workspace here.
+        # Resolved in sync construction like ``_mcp_resolve_home`` below:
+        # ``config_dir()`` does file IO and must never run on an async path.
+        self._slack_workspace_state_path: Path = config_dir() / SLACK_WORKSPACE_STATE_FILENAME
+        record = _load_slack_workspace_record(self._slack_workspace_state_path)
+        recorded_team = None if record is None else record.team_id
+        self._slack_links_team_id: str = recorded_team or ""
+        # A switch that was started and not finished (see ``_SlackWorkspaceRecord``);
+        # the first bind resolves it against the workspace the handshake names.
+        self._slack_workspace_pending: tuple[str, tuple[dict[str, object], ...]] | None = (
+            (record.pending_team_id, record.pending_swept)
+            if record is not None and record.pending_team_id
+            else None
+        )
+        # A record that EXISTS but cannot be read. Not the same as none: the
+        # first bind (boot or reconnect) re-reads it and refuses to publish a
+        # client (``workspace_record_unreadable``) until it is repaired or
+        # removed -- taking it for absent would skip the switch check once.
+        self._slack_workspace_record_damaged: bool = recorded_team is None
+        if self._slack_workspace_record_damaged:
+            logger.warning(
+                "slack: the workspace record %s exists but cannot be read; Slack "
+                "will not connect until the file is repaired or removed (then "
+                "Reconnect from Settings > Channels > Slack, or restart)",
+                self._slack_workspace_state_path,
+            )
         self._wecom_client: "WeComClient | None" = None  # set by maybe_start_wecom
         # Registry-owned live channel handles ({channel_type: client}). The
         # per-channel _<type>_client attributes are legacy mirrors kept in sync
@@ -2153,6 +2294,32 @@ class GatewayOrchestrator:
         # lives beside the rest of the data home for the life of the process.
 
         self._mcp_resolve_home: str = str(config_dir())
+
+    @property
+    def slack(self) -> RealSlackClient | None:
+        """The Slack Web API client this code path answers through.
+
+        Inside an envelope's task context (``init_socket_mode``'s listener
+        binds it; ``_dispatch_queued`` binds the queue entry's) this is the
+        client that RECEIVED the envelope, whatever ``reconnect_slack`` has
+        published since: the destinations the work holds were minted by that
+        client's workspace, and a post through another workspace's client is
+        lost or misrouted (``slack.affinity``). Everywhere else -- boot, the
+        HTTP routes, cron, the dashboard mirror -- it is the live client.
+        """
+        bound = slack_affinity.bound_client()
+        if bound is slack_affinity.UNBOUND:
+            return self._slack_live
+        return bound  # type: ignore[no-any-return]
+
+    @slack.setter
+    def slack(self, client: RealSlackClient | None) -> None:
+        """Publish *client* as the live one; bound contexts are unaffected."""
+        self._slack_live = client
+
+    @slack.deleter
+    def slack(self) -> None:
+        self._slack_live = None
 
     def _in_flight_work_counts(self) -> tuple[int, int]:
         """Return ``(turns, background)`` that a restart would interrupt.
@@ -14091,23 +14258,85 @@ class GatewayOrchestrator:
            client on the same app token would compete for the same envelopes.
            The dashboard's Web API mirror is cleared with it, so nothing sends
            through the old workspace while the new one is still unverified.
+           A close that fails or times out ABORTS the attempt: the old
+           listener may still be receiving envelopes, and steps 3-5 could
+           end without a handshake (tokens or owner now missing), leaving
+           that listener up under the credentials the operator just replaced.
+           The old client stays referenced (so a retry closes it again and
+           shutdown still reaches it), the handler module's authorization
+           subject is cleared so the surviving listener accepts no privileged
+           command, and the outcome is ``previous_client_close_failed``.
         3. Reassign ``_app_token`` / ``_bot_token`` / ``_owner_id`` /
            ``_allowed_users`` and RECOMPUTE ``_slack_enabled`` from the tokens
            now on disk. ``init_socket_mode`` early-returns on a stale False and
            its own failure paths set it False, so without this step a retry
-           after any earlier failure is a silent no-op. The dashboard state's
-           ``owner_id`` -- the authorization subject of the owner-only
-           handlers -- follows the new owner in the same step.
-        4. Rebuild the Web API client (``self.slack``) on the current bot
-           token. It is NOT published to the dashboard yet.
+           after any earlier failure is a silent no-op. The authorization
+           subject follows the new owner in the same step -- the dashboard
+           state's ``owner_id`` AND the handler module's owner / allowlist,
+           which ``init_socket_mode`` otherwise refreshes only on the path
+           that reaches a handshake: a reconnect that ends at ``tokens_missing``
+           or ``owner_id_missing`` must not leave the former owner bound there.
+        4. Build the Web API client on the current bot token as a PRIVATE
+           candidate. ``self.slack`` is None from step 2 until step 7 -- the
+           former client went with its socket -- so no reader of it (a cron
+           delivery, a dashboard send) can pair any client with a persisted
+           destination while the new workspace is unvalidated or its adoption
+           not yet durable. The listener is handed the candidate explicitly.
         5. Await ``init_socket_mode`` and ``_connect_slack`` ON THIS LOOP,
            never offloaded: ``WSSocketModeClient.__init__`` needs a current
            event loop in the constructing thread.
-        6. Record the outcome where the settings badge reads it, and publish
-           the Web API client to the dashboard ONLY on a connected socket: a
-           workspace the enterprise gate rejected, a missing owner, a policy
-           deny or a failed handshake all leave the mirror empty, so no
-           dashboard path can send through a workspace that was not admitted.
+        6. On a connected socket, compare the workspace the handshake just
+           validated (``auth.test`` team_id) with the one the persisted Slack
+           destinations were written under (``_slack_links_team_id``, kept
+           beside the session map). Those destinations (``SessionMap`` thread
+           / channel links) name no workspace -- the bot token was the only
+           identity there was -- so after a switch every one of them spells a
+           channel the new client cannot reach, or must not: a dashboard turn
+           on such a session posts into the void, and a thread id the new
+           workspace happens to reuse would route an inbound reply to the
+           wrong session through the reverse index. On a switch they are
+           swept AND flushed to disk BEFORE the client is published (step 7),
+           so no dashboard path can combine the new client with an old
+           destination, and a crash right after publishing cannot bring the
+           swept rows back on restart (``_adopt_slack_workspace``). The sweep
+           also advances the session map's link generation, so a Slack turn
+           received under the former workspace and still in flight cannot
+           re-persist its thread afterwards (``SessionMap.set_slack_link``).
+           A same-workspace token rotation is not a switch and keeps every
+           mirror. Destinations recorded under NO workspace (an install that
+           predates the record, or one whose earlier handshakes never named
+           one) are KEPT by the boot or reconnect that first establishes a
+           workspace, which only records it: every existing install passes
+           here once on its first boot after upgrading, and a sweep there
+           would end every live mirror for the sake of the rare install that
+           switched credentials before the record existed (a pre-existing
+           exposure the record closes from then on). A record that exists
+           but cannot be read refuses the connection
+           (``workspace_record_unreadable``) until it is repaired or removed:
+           taken for absent, it would skip this check once. An identity the
+           handshake could NOT
+           establish while destinations of a KNOWN workspace persist is
+           neither a switch nor an adoption: the socket is torn down again
+           and the attempt fails with
+           ``workspace_identity_unverified`` -- publishing would mean trusting
+           the former workspace's destinations against credentials nobody has
+           checked, and a transient ``auth.test`` failure (which the default
+           enterprise gate treats as pass) is exactly how a switch would slip
+           through. Only when NO identity was ever recorded is an unknown one
+           accepted, and then nothing is swept or recorded: a transient
+           ``auth.test`` failure on such an install must not cost it its
+           mirrors; the next handshake that names a workspace resolves it.
+           The identity is PERSISTED before it is adopted in memory, and a
+           record that cannot be written refuses the connection
+           (``workspace_identity_unrecorded``): an identity held only in
+           memory would let the next boot re-read the former one and sweep
+           the new workspace's rows as stale.
+        7. Record the outcome where the settings badge reads it, and publish
+           the candidate -- as ``self.slack`` AND to the dashboard -- ONLY on
+           a connected socket whose workspace is adopted: a workspace the
+           enterprise gate rejected, a missing owner, a policy deny, a failed
+           handshake or a refused adoption all leave BOTH empty, so no path in
+           this process can send through a workspace that was not admitted.
            A connected socket also fires the tracked-channel capability probe
            boot runs after its own connect.
 
@@ -14115,20 +14344,433 @@ class GatewayOrchestrator:
         mid-handshake awaits the running task and returns its result instead of
         racing a second handshake against the same client slot, and the shield
         keeps a cancelled HTTP request from cancelling the shared attempt.
-        Returns the ``connected`` / ``connect_error`` pair ``GET
+
+        The shared attempt runs under the dashboard's ``_get_config_lock()``
+        -- the lock the Slack save (``PUT /api/slack/config``) holds across
+        its ``.env`` write -- because step 1 reads the store that save
+        writes: outside it, a reconnect landing mid-save snapshots the
+        credentials the operator is replacing and hoists them AFTER the save
+        commits, leaving the former owner authorized on the live socket. The
+        lock is taken INSIDE the shared task, not by the HTTP handler: a
+        handler-held lock would serialize two concurrent clicks into two
+        full attempts, the second tearing down the socket the first had just
+        established, and the coalescing above would never see them overlap.
+        Held until the attempt ends even when every caller is cancelled (the
+        task outlives them), so a save cannot commit under a still-running
+        read. Returns the ``connected`` / ``connect_error`` pair ``GET
         /api/slack/config`` reports so the panel renders both from one
         vocabulary. Raises when the credential store cannot be read.
         """
         running = getattr(self, "_slack_reconnect_task", None)
         if running is not None and not running.done():
             return await asyncio.shield(running)
-        task = asyncio.create_task(self._reconnect_slack_once())
+        task = asyncio.create_task(self._reconnect_slack_once_locked())
         self._slack_reconnect_task = task
         try:
             return await asyncio.shield(task)
         finally:
             if self._slack_reconnect_task is task and task.done():
                 self._slack_reconnect_task = None
+
+    async def _reconnect_slack_once_locked(self) -> dict[str, object]:
+        """``_reconnect_slack_once`` under the config lock the Slack save holds."""
+        # Lazy: the handlers package imports from this module at load.
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        async with _get_config_lock():
+            return await self._reconnect_slack_once()
+
+    @staticmethod
+    def _slack_validated_team_id() -> str:
+        """The workspace ``auth.test`` last validated, "" when none is recorded.
+
+        Read from ``slack.enterprise``, which the default enterprise gate
+        populates on every ``init_socket_mode``; an edition whose gate keeps
+        its own state reports "" here, and ``reconnect_slack`` then treats the
+        identity as unknown -- accepted when no workspace was ever recorded,
+        refused (``workspace_identity_unverified``) when one was; see
+        ``reconnect_slack`` step 6.
+        """
+        # Lazy, as the other enterprise reads in this module are (see
+        # ``reload_slack_governance``): keep the slack stack off the boot path.
+        from kiro_crew.slack import enterprise as slack_enterprise
+
+        return slack_enterprise.validated_team_id()
+
+    async def _adopt_slack_workspace(self, *, source: str) -> str:
+        """Bind the persisted Slack destinations to the workspace just validated.
+
+        Called after a CONNECTED handshake (boot and ``reconnect_slack`` step
+        6) and before the client is published. Returns "" when the client may
+        be published, else the ``connect_error`` code the caller must fail the
+        attempt with, after tearing the socket down again
+        (``_bind_slack_workspace`` does both):
+
+        * ``workspace_record_unreadable`` -- the record beside the session map
+          exists but cannot be read; whether the credentials switched
+          workspace cannot be told until it is repaired or removed.
+        * ``workspace_identity_unverified`` -- a workspace is recorded and the
+          handshake named none: a switch could not be ruled out.
+        * ``workspace_identity_unrecorded`` -- the record beside the session
+          map could not be written (``_bind_slack_workspace`` answers the same
+          when the sweep's flush raises: neither write landed).
+
+        When the validated workspace differs from the recorded one, every
+        persisted Slack thread / channel link is swept. When NO workspace is
+        recorded and the handshake names one, the links are KEPT and the
+        workspace is recorded: every install that predates the record reaches
+        this branch on its first boot after upgrading, and sweeping there would
+        end every live mirror on installs whose workspace never changed, for
+        the sake of the rare one that switched credentials while stopped
+        before the record existed -- a pre-existing exposure this record
+        closes from its first boot on, not one it can close retroactively
+        without that cost. A sweep is FLUSHED to disk here,
+        awaited: the session map defers its writes to a debounced task, and a
+        client published on top of an unflushed sweep would, after a crash,
+        come back up with the former workspace's rows restored under the new
+        workspace's client. The new identity is then PERSISTED, and adopted in
+        memory only once the write succeeded: an in-memory identity without a
+        record would let the next boot re-read the former one and sweep the
+        rows the new workspace wrote since as stale. A record write that FAILS
+        undoes the sweep: the rows are snapshotted before they are cleared
+        (``snapshot_slack_links``) and, since the former workspace is still
+        the recorded one, restored and flushed (``restore_slack_links``)
+        before the attempt is refused -- a switch that did not complete must
+        not have cost the mirrors of the workspace this install remains bound
+        to. Against a CRASH in between, the switch is written to the record
+        FIRST as a marker (``_SlackWorkspaceRecord.pending_team_id``) carrying
+        that same snapshot, before the sweep reaches disk: the next connect
+        finds the former identity plus the marker and either finishes the
+        switch (credentials still name the new workspace: the now-empty sweep
+        re-runs and the record is retried) or undoes it (credentials name the
+        recorded workspace again: the rows come back from the marker's copy).
+        A marker that cannot be written refuses before anything is swept.
+
+        An unknown *current* identity with nothing recorded records nothing and
+        sweeps nothing: there are no former-workspace rows to protect, and a
+        transient ``auth.test`` failure must not cost such an install its
+        mirrors.
+        """
+        if self._slack_workspace_record_damaged:
+            # Re-read rather than trust the boot-time reading: an operator who
+            # repaired or removed the file recovers with a Reconnect, no
+            # restart needed.
+            record = await asyncio.to_thread(
+                _load_slack_workspace_record, self._slack_workspace_state_path
+            )
+            recorded = None if record is None else record.team_id
+            if record is None or recorded is None:
+                logger.warning(
+                    "slack %s: the workspace record %s exists but cannot be read; "
+                    "refusing to publish the client until it is repaired or removed",
+                    source,
+                    self._slack_workspace_state_path,
+                )
+                sel().log_api_access(
+                    caller="gateway",
+                    operation="slack.reconnect_workspace_record_unreadable",
+                    outcome="denied",
+                    source=source,
+                    resources=f"path={self._slack_workspace_state_path}",
+                )
+                return "workspace_record_unreadable"
+            self._slack_links_team_id = recorded
+            self._slack_workspace_pending = (
+                (record.pending_team_id, record.pending_swept) if record.pending_team_id else None
+            )
+            self._slack_workspace_record_damaged = False
+        current_team = self._slack_validated_team_id()
+        previous_team = self._slack_links_team_id
+        if previous_team and not current_team:
+            logger.warning(
+                "slack %s: the handshake did not establish which workspace the "
+                "credentials reach while Slack destinations recorded under "
+                "workspace %s persist; refusing to publish the client",
+                source,
+                previous_team,
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="slack.reconnect_workspace_unverified",
+                outcome="denied",
+                source=source,
+                resources=f"recorded={previous_team}",
+            )
+            return "workspace_identity_unverified"
+        sessions = self.sessions
+        pending = self._slack_workspace_pending
+        if pending is not None and current_team and current_team == previous_team:
+            # A switch to another workspace was started -- its marker and a
+            # copy of the rows it swept are on disk -- and never finished, and
+            # the credentials now name the RECORDED workspace again. Those rows
+            # are this workspace's mirrors: put them back from the copy, flush,
+            # and clear the marker. Only then is this the ordinary no-switch
+            # case below. A record write that fails leaves the marker for the
+            # next connect to resolve and refuses, as any unwritable record does.
+            pending_team, pending_rows = pending
+            restored: list[str] = []
+            if sessions is not None and pending_rows:
+                restored = sessions.restore_slack_links(list(pending_rows))
+                await sessions.aflush()
+            try:
+                await asyncio.to_thread(
+                    _store_slack_links_team_id, self._slack_workspace_state_path, previous_team
+                )
+            except OSError:
+                logger.warning(
+                    "slack %s: an interrupted switch to workspace %s was undone (%d Slack "
+                    "link(s) restored) but its marker could not be cleared; refusing to "
+                    "publish the client",
+                    source,
+                    pending_team,
+                    len(restored),
+                    exc_info=True,
+                )
+                return "workspace_identity_unrecorded"
+            self._slack_workspace_pending = None
+            logger.warning(
+                "slack %s: an interrupted switch to workspace %s was undone -- the "
+                "credentials name the recorded workspace %s again; %d swept Slack "
+                "link(s) restored from the marker",
+                source,
+                pending_team,
+                previous_team,
+                len(restored),
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="slack.workspace_switch_undone",
+                outcome="allowed",
+                source=source,
+                resources=f"recorded={previous_team} abandoned={pending_team} restored={len(restored)}",
+            )
+        if not current_team or current_team == previous_team:
+            return ""
+        swept: list[dict[str, object]] = []
+        if previous_team:
+            cleared: list[str] = []
+            if sessions is not None:
+                swept = sessions.snapshot_slack_links()
+            if pending is not None:
+                # A RETRIED switch: an earlier attempt's marker holds the rows it
+                # swept, and the map has none of them left to snapshot. They ride
+                # forward into this marker, so the copy is never overwritten with
+                # an empty sweep -- a later return to the former workspace still
+                # has every row to put back. Rows the map still holds win over
+                # the marker's copy of the same key (they are the current state).
+                held = {row.get("key") for row in swept}
+                swept = swept + [row for row in pending[1] if row.get("key") not in held]
+            # The switch MARKER goes to disk first: the former identity, the
+            # workspace being switched to, and a copy of every row about to be
+            # swept. A process that dies after the sweep's flush and before the
+            # identity is adopted below would otherwise have landed the
+            # deletion while the record still named the former workspace, and
+            # a later boot on THAT workspace's credentials would see no switch
+            # and nothing to restore -- the mirrors gone for good. With the
+            # marker, the next connect finishes the switch or undoes it (above)
+            # from the copy. A marker that cannot be written refuses before
+            # anything is swept.
+            try:
+                await asyncio.to_thread(
+                    _store_slack_links_team_id,
+                    self._slack_workspace_state_path,
+                    previous_team,
+                    pending=(current_team, swept),
+                )
+            except OSError:
+                logger.warning(
+                    "slack %s: the workspace switch marker could not be written; refusing "
+                    "to publish the client (recorded identity stays %r; nothing swept)",
+                    source,
+                    previous_team,
+                    exc_info=True,
+                )
+                sel().log_api_access(
+                    caller="gateway",
+                    operation="slack.reconnect_workspace_unrecorded",
+                    outcome="denied",
+                    source=source,
+                    resources=f"recorded={previous_team} validated={current_team} marker=unwritable",
+                )
+                return "workspace_identity_unrecorded"
+            self._slack_workspace_pending = (current_team, tuple(swept))
+            if sessions is not None:
+                cleared = sessions.clear_all_slack_links()
+                try:
+                    await sessions.aflush()
+                except Exception:
+                    # The sweep never reached disk and the switch is refused
+                    # (``_bind_slack_workspace`` turns this raise into
+                    # ``workspace_identity_unrecorded``), but the rows are
+                    # already gone from MEMORY, and the map's next deferred
+                    # write -- or ``aclose`` at shutdown -- would land exactly
+                    # that deletion under an identity that was never adopted.
+                    # Put them back before the raise leaves, so what stands in
+                    # memory matches the workspace that stays recorded; the
+                    # restore's own write is left to the map's deferred flush,
+                    # since this disk just refused one. The marker stays: the
+                    # next connect resolves it either way.
+                    put_back = sessions.restore_slack_links(swept)
+                    logger.warning(
+                        "slack %s: the workspace sweep could not be flushed; %d of %d "
+                        "swept Slack link(s) restored in memory (recorded identity "
+                        "stays %r)",
+                        source,
+                        len(put_back),
+                        len(swept),
+                        previous_team,
+                    )
+                    raise
+            logger.warning(
+                "slack %s: workspace changed (%s -> %s); cleared %d persisted Slack "
+                "thread link(s) that named channels in the former workspace",
+                source,
+                previous_team,
+                current_team,
+                len(cleared),
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="slack.workspace_switch",
+                outcome="allowed",
+                source=source,
+                resources=f"from={previous_team} to={current_team} cleared={len(cleared)}",
+            )
+        else:
+            logger.info(
+                "slack %s: first workspace recorded (%s); the persisted Slack "
+                "destinations are kept -- nothing says they were written under "
+                "another workspace, and every install that predates the record "
+                "passes here once",
+                source,
+                current_team,
+            )
+        try:
+            await asyncio.to_thread(
+                _store_slack_links_team_id, self._slack_workspace_state_path, current_team
+            )
+        except OSError:
+            # The switch did not happen: the former workspace stays the
+            # recorded one, so the rows just swept still name destinations in
+            # the workspace this install is bound to. Put them back and flush
+            # THAT, before refusing -- otherwise an unwritable crew home
+            # (ENOSPC, a read-only mount) would have deleted every mirror for
+            # an identity that was never adopted, and an outbound-only mirror
+            # has no inbound message to re-link it. The restore's flush can
+            # fail on the same disk; ``_bind_slack_workspace`` turns that into
+            # the same refusal, with the rows restored in memory and the map's
+            # own deferred write left to land them. A crash between the sweep's
+            # flush and this restore leaves the marker written above, from
+            # which the next connect undoes or finishes the switch.
+            put_back_rows: list[str] = []
+            if swept and sessions is not None:
+                put_back_rows = sessions.restore_slack_links(swept)
+                await sessions.aflush()
+            logger.warning(
+                "slack %s: the workspace record could not be written; refusing to "
+                "publish the client (recorded identity stays %r; %d of %d swept Slack "
+                "link(s) restored)",
+                source,
+                previous_team,
+                len(put_back_rows),
+                len(swept),
+                exc_info=True,
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="slack.reconnect_workspace_unrecorded",
+                outcome="denied",
+                source=source,
+                resources=(
+                    f"recorded={previous_team} validated={current_team} "
+                    f"restored={len(put_back_rows)}"
+                ),
+            )
+            return "workspace_identity_unrecorded"
+        self._slack_links_team_id = current_team
+        self._slack_workspace_pending = None
+        if previous_team and self.dashboard_state is not None:
+            # The switch is durable. The dashboard's in-memory copies of the
+            # swept links -- each slot's linked flag / thread / channel and the
+            # thread reverse index -- go now, BEFORE the client is published:
+            # a slot still carrying a former-workspace destination would offer
+            # it to the next approval prompt or thread lookup under the new
+            # client. (Turn-local mirror state is pinned to the client it was
+            # read with; see ``chat_runner``.)
+            forgotten = self.dashboard_state.forget_slack_links()
+            if forgotten:
+                logger.info(
+                    "slack %s: dropped the dashboard's Slack link state on %d slot(s) "
+                    "after the workspace switch",
+                    source,
+                    len(forgotten),
+                )
+        return ""
+
+    async def _bind_slack_workspace(self, *, source: str) -> str:
+        """``_adopt_slack_workspace`` plus the refusal it may demand.
+
+        On a non-empty code the socket the handshake just built is torn down
+        again, the live client dropped and the code recorded as the connect
+        error, so the caller only has to treat the connection as down.
+
+        The same when adoption RAISES (the sweep's ``aflush`` re-raising a
+        write error is the known case): the socket is retired and the attempt
+        fails with ``workspace_identity_unrecorded`` -- nothing was persisted,
+        the former identity stands, the swept rows are back in memory, the
+        next connect re-runs the sweep if the workspace still differs. Letting
+        the exception out instead would leave the freshly built listener live
+        on a workspace whose sweep never reached disk, behind a 500 that told
+        the operator the reconnect failed.
+        """
+        try:
+            code = await self._adopt_slack_workspace(source=source)
+        except Exception:
+            logger.warning(
+                "slack %s: binding the persisted Slack destinations to the "
+                "validated workspace failed; the new socket is torn down again "
+                "(recorded identity stays %r)",
+                source,
+                self._slack_links_team_id,
+                exc_info=True,
+            )
+            sel().log_api_access(
+                caller="gateway",
+                operation="slack.reconnect_workspace_unrecorded",
+                outcome="denied",
+                source=source,
+                resources=f"recorded={self._slack_links_team_id} adoption_raised=1",
+            )
+            code = "workspace_identity_unrecorded"
+        if code:
+            await self._retire_unverified_slack_socket()
+            self._slack_connect_error = code
+        return code
+
+    async def _retire_unverified_slack_socket(self) -> None:
+        """Tear down a socket whose workspace could not be established.
+
+        The mirror image of ``reconnect_slack`` step 2 for the client the
+        attempt just built: closed (bounded, best-effort -- it is being
+        discarded either way) and dropped along with the Web API client, so
+        nothing in this process can send or receive through credentials whose
+        workspace nobody checked against the persisted destinations.
+        """
+        client = self._socket_client
+        self._socket_client = None
+        self.slack = None
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.close(), timeout=2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "slack reconnect: closing the unverified socket client failed; it is "
+                "dropped regardless (auto-reconnect is off once close was attempted)",
+                exc_info=True,
+            )
 
     async def _reconnect_slack_once(self) -> dict[str, object]:
         """One reconnect attempt; see ``reconnect_slack`` for the ordering."""
@@ -14140,9 +14782,17 @@ class GatewayOrchestrator:
         # 2. Tear down the old client. Bounded like shutdown's close and
         # best-effort: a client whose websocket is already gone must not stop
         # the new handshake. The dashboard mirror goes with it: from here until
-        # step 6 the dashboard holds no Slack client at all.
+        # step 7 the dashboard holds no Slack client at all -- and so does the
+        # orchestrator: the Web API client is withdrawn WITH its socket, because
+        # anything that reads ``self.slack`` between here and step 7 (a cron
+        # delivery, a dashboard send) would otherwise combine whichever client
+        # it found with a persisted destination that may belong to the former
+        # workspace. Until the new workspace is validated, adopted and its sweep
+        # durable, nothing in this process holds a client to send through.
         old = self._socket_client
+        old_web = self._slack_live
         self._socket_client = None
+        self.slack = None
         if self.dashboard_state is not None:
             self.dashboard_state.slack_client = None
         if old is not None:
@@ -14151,24 +14801,52 @@ class GatewayOrchestrator:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.debug(
-                    "slack reconnect: closing the previous socket client failed", exc_info=True
+                # Abort (see reconnect_slack, step 2). The client is kept
+                # referenced, not resurrected: ``close`` already switched off
+                # its auto-reconnect, and the next attempt or shutdown closes
+                # it again. Nothing from the store is hoisted, so the caller
+                # sees the connection as it stands: down, for a named reason.
+                logger.warning(
+                    "slack reconnect: closing the previous socket client failed; "
+                    "aborting so the old listener cannot outlive its credentials",
+                    exc_info=True,
                 )
+                self._socket_client = old
+                self.slack = old_web
+                set_allowed_users(set())
+                set_owner_id("")
+                self._slack_connect_error = "previous_client_close_failed"
+                if self.dashboard_state is not None:
+                    self.dashboard_state.slack_socket_connected = False
+                    self.dashboard_state.slack_connect_error = self._slack_connect_error
+                return {"connected": False, "connect_error": self._slack_connect_error}
 
         # 3. Hoist the current credentials -- the same assignments __init__ makes,
-        # plus the dashboard's owner (init passes it to DashboardState once).
+        # plus the authorization subject: the dashboard's owner (init passes it
+        # to DashboardState once) and the handler module's owner / allowlist
+        # (init_socket_mode sets them, but only on the path that reaches a
+        # handshake -- a reconnect that stops at tokens_missing or
+        # owner_id_missing must not leave the former owner bound there).
         self._app_token = creds.get(CRED_SLACK_APP_TOKEN, "")
         self._bot_token = creds.get(CRED_SLACK_BOT_TOKEN, "")
         self._owner_id = creds.get(CRED_OWNER_ID, "")
         self._allowed_users = {self._owner_id} if self._owner_id else set()
         self._slack_enabled = bool(self._app_token and self._bot_token)
         self._slack_connect_error = ""
+        set_allowed_users(self._allowed_users)
+        set_owner_id(self._owner_id)
         if self.dashboard_state is not None:
             self.dashboard_state.owner_id = self._owner_id
 
-        # 4. Web API client on the current bot token. Not mirrored yet: the
-        # workspace behind this token has not passed validation.
-        self.slack = RealSlackClient(self._bot_token) if self._slack_enabled else None
+        # 4. Web API client on the current bot token -- a PRIVATE candidate.
+        # ``self.slack`` stays None until step 7: the workspace behind this
+        # token has not passed validation, and once it has, its adoption (the
+        # sweep of former-workspace destinations and the identity record) must
+        # be durable before any reader of ``self.slack`` can post through it.
+        # The listener gets the candidate explicitly, so the socket answers
+        # through the client that belongs to it without the orchestrator
+        # publishing that client to everyone else first.
+        candidate = RealSlackClient(self._bot_token) if self._slack_enabled else None
 
         connected = False
         if not self._slack_enabled:
@@ -14178,7 +14856,7 @@ class GatewayOrchestrator:
             if seen is None:
                 seen = self._slack_seen = SeenCache()
             # 5. On the loop, never offloaded (see reconnect_slack).
-            await init_socket_mode(self, seen)
+            await init_socket_mode(self, seen, web_api_client=candidate)
             if self._socket_client is None:
                 # init_socket_mode declined -- owner ID missing, or the
                 # workspace failed enterprise validation. It logged the
@@ -14192,8 +14870,24 @@ class GatewayOrchestrator:
                     # The channels governance gate drops the client silently.
                     self._slack_connect_error = "denied_by_policy"
 
-        # 6. Record where GET /api/slack/config reads it; the dashboard gets the
-        # Web API client only behind a connected socket.
+        # 6. Workspace identity (see reconnect_slack, step 6). Destinations of a
+        # KNOWN workspace persist and the handshake could not say which
+        # workspace it reached: refuse -- tear the socket down again rather
+        # than publish a client nobody checked against those rows. Otherwise
+        # adopt the validated workspace: sweep + flush on a switch or a first
+        # record, persist the identity (a record that cannot be written refuses
+        # too), all before anything can send through the new client.
+        if connected and await self._bind_slack_workspace(source="reconnect"):
+            connected = False
+
+        # 7. Publish: the orchestrator's own handle and the dashboard mirror
+        # both take the candidate only behind a connected socket whose workspace
+        # is adopted. A failed attempt leaves both None -- down, for the named
+        # reason -- rather than a client on credentials nobody checked against
+        # the persisted destinations. Then record where GET /api/slack/config
+        # reads it.
+        if connected:
+            self.slack = candidate
         if self.dashboard_state is not None:
             self.dashboard_state.slack_client = self.slack if connected else None
             self.dashboard_state.slack_socket_connected = connected
@@ -14802,6 +15496,19 @@ class GatewayOrchestrator:
         print("👻 Kiro Crew gateway starting…")
 
         connected = await self._connect_slack()
+        # Bind the persisted Slack destinations to the workspace this client
+        # belongs to (``_bind_slack_workspace``): credentials replaced while
+        # the gateway was down name another workspace exactly as a reconnect's
+        # do, so the same sweep runs here, and the same refusals apply: a
+        # workspace the handshake could not name while one is recorded, or a
+        # record that cannot be written, leaves the socket torn down again and
+        # the dashboard mirror (published when the dashboard started, above)
+        # withdrawn, so nothing sends through credentials nobody checked
+        # against the persisted destinations.
+        if connected and await self._bind_slack_workspace(source="boot"):
+            connected = False
+            if self.dashboard_state:
+                self.dashboard_state.slack_client = None
         # Record the real socket outcome so status surfaces (e.g. the Slack
         # settings badge) can distinguish "connected" from "tokens present
         # but connect failed" — slack_client alone only proves the latter.
