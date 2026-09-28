@@ -64,7 +64,7 @@ import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
 from kiro_crew.config.paths import data_home
 from kiro_crew.crew_log.entry_types import (
@@ -124,7 +124,11 @@ from kiro_crew.session_ledger import EVENT_KINDS as LEDGER_EVENT_KINDS
 from kiro_crew.session_ledger import LEDGER_ENTRY_TYPE
 from kiro_crew.session_ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from kiro_crew.session_ledger import TERMINAL_PHASES as LEDGER_TERMINAL_PHASES
-from kiro_crew.work_vocab import WORK_CONDUCTOR_FIELDS
+from kiro_crew.work_vocab import (
+    WORK_CONDUCTOR_FIELDS,
+    WorkBoardItem,
+    WorkBoardView,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3411,6 +3415,7 @@ def _work_start() -> dict[str, Any]:
         "omitted": 0,
         "entries": 0,
         "first_entry_at": "",
+        "last_entry_at": "",
         "generation": "",
     }
 
@@ -3511,6 +3516,13 @@ def _work_step(state: dict[str, Any], entry: Entry) -> None:
     state["entries"] += 1
     if not state["first_entry_at"]:
         state["first_entry_at"] = _work_iso(entry.time)
+    # HERE, where an entry is accepted, rather than beside any one action: this is the
+    # answer to "how old is this board's information", and a reader asking that must
+    # not get a different answer depending on which kind of entry came last. Taken from
+    # an item's own stamps instead, a conductor-only round -- a decision, a verdict, an
+    # acceptance, a bind -- moves nothing, so a board that just changed keeps ageing and
+    # eventually reads as stale while it is in fact current.
+    state["last_entry_at"] = _work_iso(entry.time)
     if not state["created_at"] and data.get("actor") == "conductor":
         state["created_at"] = _work_iso(entry.time)
     action = _as_str(data.get("action"))
@@ -3734,10 +3746,18 @@ def _work_is_progress(event: Mapping[str, Any]) -> bool:
     return event.get("kind") == "report" and event.get("status") == "progress"
 
 
-def _work_render(state: dict[str, Any]) -> dict[str, Any]:
+def _work_render(state: dict[str, Any]) -> WorkBoardView:
     """The board in the shape its readers already consume: the conductor header and
-    every item in creation order, each with its event tail."""
-    items = []
+    every item in creation order, each with its event tail.
+
+    The return is NARROWED to :class:`~kiro_crew.work_vocab.WorkBoardView` rather than
+    left as ``dict``: a reader mapping this onto a dashboard's own contract type then
+    has both ends checked by mypy, and a field renamed here is an error at every such
+    reader instead of a key that silently reads as missing. The projection kernel in
+    ``kiro_crew.projection`` is unchanged -- its Protocol asks for ``-> dict`` and a
+    return type is covariant.
+    """
+    items: list[WorkBoardItem] = []
     for item_id in state["order"]:
         item = state["items"].get(item_id)
         if item is None:
@@ -3747,7 +3767,7 @@ def _work_render(state: dict[str, Any]) -> dict[str, Any]:
         rendered["events"] = [
             {key: value for key, value in event.items() if key != "_t"} for event in item["events"]
         ]
-        items.append(rendered)
+        items.append(cast("WorkBoardItem", rendered))
     return {
         "conductor": {
             "schema": 1,
@@ -3760,6 +3780,10 @@ def _work_render(state: dict[str, Any]) -> dict[str, Any]:
             "created_at": state["created_at"],
             "entries": state["entries"],
             "first_entry_at": state["first_entry_at"],
+            # ``.get``: a checkpoint written before this key existed resumes without
+            # it, and a KeyError here would turn every read of that slot into a crash
+            # rather than into one missing display value.
+            "last_entry_at": state.get("last_entry_at", ""),
             "generation": state["generation"],
         },
         "items": items,
@@ -4214,7 +4238,15 @@ _FOLDS: Final[dict[str, _Fold]] = {
         "work",
         _work_start,
         _work_step,
-        _work_render,
+        # ONE cast, here, because ``_work_render`` promises a TypedDict while this
+        # registry field asks for ``dict[str, Any]``. mypy refuses that assignment even
+        # though it holds at runtime: a TypedDict is assignable to a read-only mapping
+        # but not to a mutable ``dict[str, V]``, which is invariant in V. Widening the
+        # field to ``Mapping`` instead pushes the same refusal onto ``Projection.value``
+        # and two ``view`` methods, so it would cost three shared types rather than one
+        # line. Safe in the direction that matters: the registry only CALLS this, and a
+        # caller wanting the checked shape reads ``_work_render``'s own annotation.
+        cast("Callable[[dict[str, Any]], dict[str, Any]]", _work_render),
         bind_slot=_work_bind_slot,
         affects=frozenset({WORK_ENTRY_TYPE}),
     ),
