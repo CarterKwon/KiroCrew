@@ -1274,14 +1274,14 @@
       "copy_nothing": "Rien à copier ici.",
       "copy_hint": "Copier le lien",
       "cmd_search_mates": "Rechercher des coéquipiers",
-      "cmd_search_mates_sub": "Trouvez un coéquipier par son nom et ouvrez sa conversation.",
+      "cmd_search_mates_sub": "Trouve un coéquipier par son nom et ouvre sa conversation.",
       "placeholder_mates": "Rechercher dans tous les coéquipiers…",
       "action_search_mates": "Rechercher des coéquipiers",
       "action_open_mate": "Ouvrir la conversation",
       "action_show_all_mates": "Afficher tous les coéquipiers",
       "fallback_mates": "Rechercher « {{query}} » dans les coéquipiers",
       "no_match_show_all_mates": "Aucun coéquipier ne correspond à « {{query}} » — afficher tous",
-      "no_mates_yet": "Pas encore de coéquipiers. Créez-en un sur la page des coéquipiers et il apparaîtra ici."
+      "no_mates_yet": "Pas encore de coéquipiers. Crées-en un sur la page des coéquipiers et il apparaîtra ici."
     },
     "crewCompanion": {
       "accessory": {
