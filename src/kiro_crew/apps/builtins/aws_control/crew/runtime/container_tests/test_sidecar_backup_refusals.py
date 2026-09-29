@@ -336,8 +336,8 @@ def test_an_entry_whose_type_readdir_withheld_is_classified_before_the_fd_closes
             def __enter__(self) -> list[_TypeWithheld]:
                 return [_TypeWithheld(name, arg)]
 
-            def __exit__(self, *exc: object) -> bool:
-                return False
+            def __exit__(self, *exc: object) -> None:
+                """Never suppresses, so the real listing's behaviour is unchanged."""
 
         return _Listing()
 
@@ -396,7 +396,7 @@ def test_the_authority_descriptors_are_closed_when_an_enumerator_raises(tmp_path
     """
     settings = _settings(tmp_path)
     _transcript(settings, b"{}")
-    opened: list[object] = []
+    opened: list[backup_mod.Snapshot] = []
     real_open_snapshot = backup_mod.open_snapshot
 
     def recording_open_snapshot(path, *, root):
