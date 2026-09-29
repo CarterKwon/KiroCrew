@@ -67,6 +67,7 @@ import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import ResizeHandle from '../components/ResizeHandle'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../components/SearchFilterBar'
+import { ListDock } from '../components/ListDock'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_META_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../components/listShell'
 import { safeSetItem } from '../utils/safeStorage'
 import { PINNED_SESSION_ORDER_CHANGED_EVENT, PINNED_SESSION_ORDER_KEY, movePinnedSession, persistPinnedSessionOrder, readPinnedSessionOrder, reconcilePinnedSessionOrder } from '../utils/pinnedSessionOrder'
@@ -9250,6 +9251,11 @@ function ChatSidebar({
         </div>
       )}
 
+      {/* The floating dock (components/ListDock): the glass search capsule, the
+          filter chips and the list-level notices hover over the lanes, and
+          every lane's scroller pads its top by the dock's live height. */}
+      <ListDock dock={(
+        <>
       {/* Search with inline sort/filter control — the shared list-panel
           search row (components/SearchFilterBar), also mounted by the Crew
           Members roster. */}
@@ -9982,7 +9988,6 @@ function ChatSidebar({
         className="mx-2 mt-2 shrink-0"
         testId="rename-error"
       />
-      <LayoutGroup id="chat-slots">
         {/* An instance that is CONNECTED but did not answer contributes no rows.
           *  Saying so is the difference between "that instance has nothing open" and
           *  "we could not ask": without this line the list silently claims a
@@ -10022,6 +10027,9 @@ function ChatSidebar({
             testId="instance-sessions-error"
           />
         )}
+        </>
+      )}>
+      <LayoutGroup id="chat-slots">
         {conductorLaneActive ? (
           // Conductor lane: every session nested under the session that OPENED it.
           //
@@ -10385,8 +10393,11 @@ function ChatSidebar({
             </DndContext>
           </motion.div>
         ) : (
-          // Trello-style horizontal column strip
-          <div className="flex-1 min-h-0 flex flex-col">
+          // Trello-style horizontal column strip. The columns scroll on their own
+          // inside the strip, so the lane itself steps below the floating dock
+          // (ListDock) rather than scrolling under it; the hidden-folders line and
+          // the board error above the strip stay reachable that way.
+          <div className="flex-1 min-h-0 flex flex-col pt-[var(--list-dock-h,0.5rem)]">
           {/* Lane-level fallback ownership (exactly one mount ever renders):
            *  - no columnId (New-menu create): no per-column mount exists;
            *  - board-flat: the columnId-scoped mounts are hidden with folders;
@@ -10758,6 +10769,7 @@ function ChatSidebar({
           </div>
         )}
       </LayoutGroup>
+      </ListDock>
 
       {/* Drag-move confirmation + undo. Deliberately a SIBLING of the lanes and
           a sibling ABOVE the separator, so it never covers the row that just

@@ -114,6 +114,7 @@ import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
 import ResizeHandle from '../../components/ResizeHandle'
 import { cn } from '../../lib/utils'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../../components/listShell'
+import { ListDock } from '../../components/ListDock'
 import { useColumnResize } from '../../hooks/useColumnResize'
 import { loadColumnWidth } from '../../lib/columnWidth'
 import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
@@ -2562,6 +2563,10 @@ export default function MembersPage() {
             />
           </div>
         )}
+        {/* The floating dock (components/ListDock): the glass search capsule and
+            the filter chip hover over the roster, which scrolls under them. */}
+        <ListDock dock={(
+          <>
         {/* The Sessions sidebar's search row (components/SearchFilterBar): the
             same field, clear button and inline sort/filter menu. The menu holds
             what the sidebar's holds for sessions, in the roster's terms — a
@@ -2709,6 +2714,8 @@ export default function MembersPage() {
             {t('pages.membersPage.member_gone_roster', { name: gone.name })}
           </div>
         )}
+          </>
+        )}>
         <ul
           className={`${LIST_BODY_CLS} list-none m-0`}
           style={{ scrollbarWidth: 'none' }}
@@ -2824,6 +2831,7 @@ export default function MembersPage() {
             )
           })}
         </ul>
+        </ListDock>
         {/* Window-splitter between roster and thread: the same component as the
             Sessions sidebar's grip, sitting on the card's right border the same
             way (absolute, 12px rounded-xl corner inset), so the two pages' edges
