@@ -42,6 +42,13 @@ import { Btn, Input, SendBtn, Toggle } from './ui'
  */
 
 export const START_MEET_CREWMATES_EVENT = 'mc-start-meet-crewmates'
+/**
+ * The Crewmates page announces itself with this once its roster has loaded and
+ * holds no crewmate. Unlike {@link START_MEET_CREWMATES_EVENT} (the user asked)
+ * it is a request, not an order: the host opens the flow only if it is still
+ * due, so the first visit shows it and later visits do not.
+ */
+export const CREWMATES_PAGE_ENTERED_EVENT = 'mc-crewmates-page-entered'
 
 const TOTAL_STEPS = 4
 const NAME_MAX = 24

@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { api, type MemberRosterRow } from '../api/client'
 import { membersRosterQuery } from '../api/membersQuery'
-import { START_MEET_CREWMATES_EVENT } from '../components/MeetCrewmatesFlow'
+import { CREWMATES_PAGE_ENTERED_EVENT, START_MEET_CREWMATES_EVENT } from '../components/MeetCrewmatesFlow'
 import { PREVIEW_CREW } from '../utils/previewFlags'
 import { usePreviewFlag } from './usePreviewFlag'
 import { useTheme } from './useTheme'
@@ -45,7 +45,9 @@ export function hasNoCustomAgents(installed: readonly { name: string; kirocrew_o
  * theme-config endpoint, the same server-backed record the other chapters
  * use, so a second machine does not replay it.
  *
- * The Crewmates page re-opens it on demand through the
+ * The Crewmates page also fires it on the user's first visit while the page
+ * has no crewmate (`mc-crewmates-page-entered`: shown only while still due,
+ * whatever custom agents exist), and re-opens it on demand through the
  * `mc-start-meet-crewmates` window event (no eligibility check: the page is
  * itself behind the preview, and the user asked).
  */
@@ -71,6 +73,7 @@ export function useMeetCrewmatesGate(): {
     privacyAcked,
     themeBootReady,
     crewmatesOnboarded,
+    crewmatesFlowSeen,
     markCrewmatesOnboarded,
   } = useTheme()
   const crewPreview = usePreviewFlag(PREVIEW_CREW)
@@ -105,6 +108,27 @@ export function useMeetCrewmatesGate(): {
   useEffect(() => {
     if (autoOpen && !closedThisSessionRef.current) setOpen(true)
   }, [autoOpen])
+
+  // First visit to the Crewmates page. The page only announces itself while
+  // its roster holds no crewmate, and it is itself behind the preview, so the
+  // one thing left to decide here is whether the chapter is still due. The
+  // custom-agent condition above does NOT apply: it keeps the flow from
+  // interrupting an existing user unasked, and a user who opened the
+  // Crewmates page came looking for exactly this. The entry is remembered, not
+  // judged on arrival: on a reload straight into /members the roster can land
+  // before the theme boot says whether the chapter is still due.
+  // `crewmatesFlowSeen`, not `crewmatesOnboarded`: the latter also counts an
+  // existing user as done, and that user is exactly who reaches the flow here.
+  const pageEntryDue = firstRunDone && !crewmatesFlowSeen
+  const [pageEntered, setPageEntered] = useState(false)
+  useEffect(() => {
+    const entered = () => setPageEntered(true)
+    window.addEventListener(CREWMATES_PAGE_ENTERED_EVENT, entered)
+    return () => window.removeEventListener(CREWMATES_PAGE_ENTERED_EVENT, entered)
+  }, [])
+  useEffect(() => {
+    if (pageEntered && pageEntryDue && !closedThisSessionRef.current) setOpen(true)
+  }, [pageEntered, pageEntryDue])
 
   // A failed eligibility read is shown, not swallowed: without this the flow
   // would simply never appear and the user would not know why. Dismissal is
