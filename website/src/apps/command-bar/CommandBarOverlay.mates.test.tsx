@@ -357,8 +357,12 @@ describe('command bar — crewmates view, listing and search', () => {
       slots: [{ key: 'member-oncall', mode: 'member', agent: 'oncall', running: true }],
       unreadSlots: [],
     }
-    // Any re-render republishes the store read; the key change is what re-maps.
-    type('oncall')
+    // An ArrowDown, deliberately NOT a keystroke in the query. Typing would change
+    // `mateQuery` and so change the key on its own, which would let this pass with the
+    // running set absent from the key — the very thing it exists to pin. This only
+    // re-renders, so the republished store read is the ONLY thing that can move the
+    // key, and a stale cached row is what fails here.
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'ArrowDown' })
     await waitFor(() => expect(rowByText('oncall').textContent).toContain('Working'))
   })
 
