@@ -2399,6 +2399,160 @@ class TestADismissalOutlivesTheManager:
         assert dismissed_panel_ids() == frozenset({"kept"})
 
 
+class TestADismissalHoldsOnBothReaders:
+    """A dismissal has to hold on BOTH durable readers, not just one.
+
+    There are two, and they were reported separately: the WS reconnect replay and
+    the REST listing. Every other dismissal test above calls
+    :func:`read_panel_records` directly, which is the shared helper -- so all of
+    them would still pass if one reader obtained its records some other way and
+    never consulted the store. That is the whole shape of the original report: the
+    listing and the replay each excluded only the ids the LIVE manager held, so a
+    delete that left the folder behind came back on the next reconnect.
+
+    So the two readers are exercised at their own entry points here, and the
+    filter's position -- inside the shared helper rather than at either call site
+    -- is pinned structurally, because that position is the only reason one test
+    can answer for both.
+    """
+
+    def request(self, state, caller: str, app: str = "", *, internal: bool = True):
+        headers = {"X-Session-Key": caller}
+        values: dict[str, object] = {"internal_auth": internal}
+        if app:
+            values["app"] = app
+        return SimpleNamespace(
+            app={"state": state},
+            headers=headers,
+            query={},
+            get=lambda key, default=None: values.get(key, default),
+        )
+
+    def state(self, slot_app: str = ""):
+        manager = SimpleNamespace(all_agents=[])
+        slots = {"chat-1": SimpleNamespace(_app=slot_app)}
+        return SimpleNamespace(subagents=manager, _slots=slots, get_slot=slots.get)
+
+    def run_listing(self, monkeypatch, caller: str = "dashboard:chat-1"):
+        """Drive ``GET /api/spawn`` end to end and return its agent ids."""
+
+        async def fake_scope(request, op):
+            return object(), None
+
+        monkeypatch.setattr(messaging, "internal_memory_scope", fake_scope)
+        payload = asyncio.get_event_loop().run_until_complete(
+            messaging.api_spawn_list(self.request(self.state(), caller))
+        )
+        body = json.loads(payload.text or "{}")
+        return [entry["id"] for entry in body["agents"]]
+
+    def replay_records(self, seen: set[str] | None = None):
+        """The WS reconnect replay's OWN query, with its own constants.
+
+        ``ws.py`` asks for persisted records with the replay keep and age window and
+        an ``exclude_ids`` set built from the live frames it already sent, then turns
+        each survivor into a ``subagent_done`` frame. Asking with those arguments is
+        what makes this the replay's question rather than a generic one.
+        """
+        return read_panel_records(
+            keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+            max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+            exclude_ids=seen or set(),
+        ).records
+
+    def test_a_dismissed_run_is_absent_from_the_rest_listing(self, agent_root, monkeypatch):
+        write_record(agent_root, "keep11", parent_session="dashboard:chat-1")
+        write_record(agent_root, "gone11", parent_session="dashboard:chat-1")
+        # Control: both are listed before the dismissal, so absence below is the
+        # dismissal doing it rather than the record never having been admitted.
+        assert sorted(self.run_listing(monkeypatch)) == ["gone11", "keep11"]
+
+        assert record_panel_dismissal("gone11") is True
+
+        assert self.run_listing(monkeypatch) == ["keep11"]
+
+    def test_a_dismissed_run_is_absent_from_the_ws_reconnect_replay(self, agent_root):
+        """The reader that actually resurrected the card, asked its own question."""
+        write_record(agent_root, "keep22", parent_session="dashboard:chat-1")
+        write_record(agent_root, "gone22", parent_session="dashboard:chat-1")
+        assert sorted(ids(self.replay_records())) == ["gone22", "keep22"]
+
+        assert record_panel_dismissal("gone22") is True
+
+        surviving = self.replay_records()
+        assert ids(surviving) == ["keep22"]
+        # And nothing downstream can put it back: the frames the replay sends are
+        # built from these records alone.
+        frames = [
+            build_persisted_subagent_frame(record, redact=lambda text: text) for record in surviving
+        ]
+        assert [frame["data"]["id"] for frame in frames] == ["keep22"]
+
+    def test_the_replay_still_honours_its_live_exclusions(self, agent_root):
+        """Control on the shape: the dismissal filter is added to that set, not swapped in."""
+        write_record(agent_root, "live33", parent_session="dashboard:chat-1")
+        write_record(agent_root, "gone33", parent_session="dashboard:chat-1")
+        write_record(agent_root, "keep33", parent_session="dashboard:chat-1")
+        record_panel_dismissal("gone33")
+        assert ids(self.replay_records(seen={"live33"})) == ["keep33"]
+
+    def test_the_filter_lives_inside_the_shared_reader_not_at_a_call_site(self):
+        """Why one store answers for both readers -- pinned, not assumed.
+
+        Filtering at the two call sites would read the same on the day it is
+        written and would leave the next reader uncovered. The filter is inside
+        :func:`read_panel_records`, so a third reader inherits it by construction.
+        """
+        import ast
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        tree = ast.parse(
+            (root / "src/kiro_crew/subagent_persistence.py").read_text(encoding="utf-8")
+        )
+        reader = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "read_panel_records"
+        )
+        called = {
+            getattr(call.func, "id", "") or getattr(call.func, "attr", "")
+            for call in ast.walk(reader)
+            if isinstance(call, ast.Call)
+        }
+        assert "dismissed_panel_ids" in called, (
+            "read_panel_records does not consult the dismissal store, so each reader "
+            "would have to filter for itself and the next one added would not"
+        )
+
+    def test_both_readers_go_through_that_reader_and_nothing_lower(self):
+        """Neither reader may assemble records itself and skip the filter.
+
+        Matched on a word boundary, because ``_panel_record`` is a SUBSTRING of
+        ``read_panel_records`` -- a plain ``in`` test reports every correct reader
+        as an offender, and the failure reads exactly like a real bypass.
+        """
+        import re
+
+        builder = re.compile(r"(?<![A-Za-z0-9_])_panel_record(?![A-Za-z0-9_])")
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for relative in (
+            "src/kiro_crew/dashboard/ws.py",
+            "src/kiro_crew/dashboard/handlers/messaging.py",
+        ):
+            source = (root / relative).read_text(encoding="utf-8")
+            # Control: this reader really is one of the two, so a renamed file
+            # cannot make the assertion below pass by matching nothing.
+            assert "read_panel_records" in source, f"{relative} no longer reads persisted records"
+            assert not builder.search(source), (
+                f"{relative} reaches the per-folder record builder directly, which "
+                "skips the dismissal filter that read_panel_records applies"
+            )
+        # Control on the needle itself: it must match the real thing somewhere, or
+        # the two assertions above pass because the pattern is broken.
+        owner = (root / "src/kiro_crew/subagent_persistence.py").read_text(encoding="utf-8")
+        assert builder.search(owner), "the _panel_record needle matches nothing anywhere"
+
+
 class TestTheDismissalStoreIsRegisteredEverywhereItMustBe:
     """The store's protection is four registrations, and a rename breaks them silently.
 
