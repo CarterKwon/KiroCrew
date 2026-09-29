@@ -169,7 +169,11 @@ export default function SettingsSearch() {
   }
 
   return (
-    <div ref={rootRef} className="relative shrink-0">
+    // `settings-search` (index.css) turns the boxed input's `focus-ring` neutral:
+    // Settings is where the user hunts for a switch, and its search bar wears
+    // the same rule as the glass panes -- focus is the control stepping clearer
+    // (darker border, soft neutral halo), never the theme colour.
+    <div ref={rootRef} className="settings-search relative shrink-0">
       {floating ? (
         // The capsule host owns the chrome, so this input stays borderless;
         // SearchInput has no way to drop its own box.

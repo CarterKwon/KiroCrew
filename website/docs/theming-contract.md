@@ -97,7 +97,7 @@ incognito chip and a hovered pane swap them in via `glass-accent` / `glass-warn`
 the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
 the glass must read as a lit pane on any light palette and as smoked glass on any
 dark one, and a section's tile is an identity mark that must look the same in
-every theme — the same reasoning as the composer halo's rest shadow. Adding one
+every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
 of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
 work; adding a color a pack should be able to change takes the role path below.
 

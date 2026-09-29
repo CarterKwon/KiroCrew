@@ -1,8 +1,8 @@
 /**
  * The composer sits inside ONE Liquid Glass dock pane (`composer-dock`, built
  * from components/Glass.tsx): `--glass-tint` over the blurred transcript, the
- * `--glass-band` light bands, `--glass-edge` side lines, no ring, and the composer halo for
- * depth. The pane also holds an approval bar fused to the composer's top and the
+ * `--glass-band` light bands, `--glass-edge` side lines, no ring, and the neutral
+ * `glass-shadow` for depth. The pane also holds an approval bar fused to the composer's top and the
  * collapsed bar, so those share the material instead of meeting it at a seam;
  * the wrapper's own surface and border are therefore transparent in every mode
  * (an incognito / temporary session still paints its coloured border). The pane
@@ -20,6 +20,9 @@ import { createTestStore, renderWithProviders } from './helpers'
 import type { RootState } from '../store'
 
 const INDEX_CSS = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+const CHAT_INPUT_SRC = readFileSync(resolve(process.cwd(), 'src/components/ChatInput.tsx'), 'utf-8')
+const SETTINGS_SEARCH_SRC = readFileSync(resolve(process.cwd(), 'src/pages/settings/SettingsSearch.tsx'), 'utf-8')
+const FOLLOW_UP_BAR_SRC = readFileSync(resolve(process.cwd(), 'src/components/FollowUpBar.tsx'), 'utf-8')
 
 const dockOf = (wrapper: HTMLElement) => wrapper.closest('[data-testid="composer-dock"]') as HTMLElement
 
@@ -64,22 +67,22 @@ describe('composer liquid glass', () => {
     renderWithProviders(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} />, { store })
     const wrapper = screen.getByTestId('input-wrapper')
     expect(wrapper.className).toContain('bg-transparent')
-    expect(wrapper.className).toContain('focus-within:border-accent/50')
+    expect(wrapper.className).not.toContain('focus-within:border-accent')
     expect(wrapper.className).not.toContain('bg-bg-elevated')
     const dock = dockOf(wrapper)
     expect(dock.className).toContain('approval-glow')
-    expect(dock.className).not.toContain('composer-halo')
+    expect(dock.className).toContain('glass-shadow')
     expect(screen.getByRole('button', { name: /allow once/i })).toBeTruthy()
   })
 
-  it('mounts one dock pane around the wrapper: no ring on the box, halo, 16px glass, theme tint', () => {
+  it('mounts one dock pane around the wrapper: no ring on the box, neutral shadow, 16px glass, theme tint', () => {
     renderWithProviders(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} />)
     const wrapper = screen.getByTestId('input-wrapper')
     const dock = dockOf(wrapper)
     expect(dock).not.toBeNull()
     // The material draws no rim: the outer box carries only the caller's shadow.
     expect(dock.className).not.toMatch(/\bborder\b/)
-    expect(dock.className).toContain('composer-halo')
+    expect(dock.className).toContain('glass-shadow')
     expect(dock.style.borderRadius).toBe('16px')
     // Glass IS the host: the dock element itself is the LiquidGlass root (no
     // wrapper box), carrying the radius, the caller's class and the effect
@@ -94,21 +97,65 @@ describe('composer liquid glass', () => {
   })
 
   it('defines the glass tokens (tint, focus tint, band, edge, hairline) for both polarities', () => {
-    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint: rgba\(30, 30, 34, 0\.40\); --glass-tint-focus: rgba\(84, 84, 92, 0\.72\); --glass-band: rgba\(255, 255, 255, 0\.22\); --glass-edge: rgba\(255, 255, 255, 0\.14\); --glass-edge-focus: rgba\(255, 255, 255, 0\.55\); --glass-hairline: rgba\(0, 0, 0, 0\.50\); \}/)
+    expect(INDEX_CSS).toMatch(/:root \{ --glass-tint: rgba\(30, 30, 34, 0\.40\); --glass-tint-focus: rgba\(56, 56, 62, 0\.50\); --glass-band: rgba\(255, 255, 255, 0\.22\); --glass-edge: rgba\(255, 255, 255, 0\.14\); --glass-edge-focus: rgba\(255, 255, 255, 0\.55\); --glass-hairline: rgba\(0, 0, 0, 0\.50\); \}/)
     expect(INDEX_CSS).toMatch(/\[data-mode="light"\] \{ --glass-tint: rgba\(238, 238, 243, 0\.45\); --glass-tint-focus: rgba\(255, 255, 255, 0\.92\); --glass-band: rgba\(255, 255, 255, 0\.92\); --glass-edge: rgba\(0, 0, 0, 0\.24\); --glass-edge-focus: rgba\(0, 0, 0, 0\.60\); --glass-hairline: rgba\(0, 0, 0, 0\.20\); \}/)
   })
 
-  // The theme-colored focus glow is the session composer's own cue. Every other
-  // glass surface wears the neutral `glass-shadow`, never `composer-halo`. The
-  // neutral focus cue is the deeper shadow PLUS the brighter focus tint, and the
-  // tint step is for neutral panes only: an accent / warn pane keeps its hue
-  // while a control inside it has focus.
-  it('keeps the accent focus glow on the composer only', () => {
+  it('stands the context shelf on a short fade to page colour', () => {
+    // The shelf (agent, project, branch, model chips) sits below the glass on
+    // the bare transcript, which scrolls under the floating dock. It fades from
+    // nothing at the pane's bottom edge to solid `--bg` 6px below it -- short,
+    // so a bubble edge scrolling under the strip cannot show through as a
+    // second line under the pane.
+    // Neither the shelf nor the fade is its own stacking context: the
+    // `z-index: -1` layer resolves against the dock's input-area wrapper
+    // (ChatPage's `relative z-10 dock-inert`), so it sits BEHIND the pane's
+    // shadow (a fade painted over the shadow whitened it out part-way and left
+    // a bright band under the pane), above the transcript and below the chips;
+    // that wrapper is also its containing block, so it spans the dock root --
+    // which stops short of the scrollbar gutter -- and ChatInput hands it the
+    // shelf's height. Nothing paints inside the pane.
+    expect(INDEX_CSS).not.toMatch(/\.glass-shelf \{/)
+    expect(INDEX_CSS).toMatch(/\.glass-shelf::before \{[^}]*position: absolute; left: 0; right: 0; bottom: 0; height: calc\(var\(--glass-shelf-h, 32px\) \+ 4px\);[^}]*linear-gradient\(to bottom, transparent, var\(--bg\) 6px\);[^}]*z-index: -1;/)
+    expect(INDEX_CSS).not.toMatch(/\.glass-shelf::before \{[^}]*100vw/)
+    // The containing-block contract: neither the shelf nor ChatInput's
+    // `input-area` root may become positioned, or the fade would resolve
+    // against them instead of the dock wrapper (Design, round 1).
+    expect(CHAT_INPUT_SRC).toMatch(/className=\{`input-area px-4 pb-1 \$\{hasApproval \? 'pt-0' : 'pt-1'\} mx-auto w-full flex flex-col`\}/)
+    expect(CHAT_INPUT_SRC).not.toMatch(/className=\{`input-area [^`]*\b(relative|absolute|fixed|sticky)\b/)
+    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
+  })
+
+  it('lets the follow-up chips keep their top and bottom hairline', () => {
+    // The chip row is overflow-x:auto, which makes overflow-y auto too, and the
+    // glass hairline is drawn 0.5px OUTSIDE each chip's box -- a row exactly one
+    // chip tall clipped it top and bottom. One pixel of padding, cancelled by
+    // the negative margin, lets the line through at the same row height.
+    expect(FOLLOW_UP_BAR_SRC).toMatch(/className=\{`flex \$\{CHIP_ROW_GAP\} overflow-x-auto items-end py-px -my-px`\}/)
+  })
+
+  // Every glass surface, the session composer included, wears the neutral
+  // `glass-shadow`: focus is the deeper shadow PLUS the brighter focus tint and
+  // darker side lines, never a theme-colored glow or ring. The tint step is for
+  // neutral panes only: an accent / warn pane keeps its hue while a control
+  // inside it has focus. A pending approval takes the shadow slot for its warm
+  // glow and leaves the focus step on.
+  it('gives every glass pane the same neutral focus cue, no accent glow', () => {
     expect(INDEX_CSS).toMatch(/\.glass-shadow:focus-within \{ box-shadow: 0 0 18px rgba\(0, 0, 0, 0\.14\); \}/)
+    expect(INDEX_CSS).toMatch(/\.glass-shadow\.approval-glow, \.glass-shadow\.approval-glow:focus-within \{ box-shadow: var\(--approval-shadow\); \}/)
+    expect(INDEX_CSS).toMatch(/@media \(prefers-reduced-motion:reduce\)\{\.approval-glow\{animation:none;--glow-strength:\.6\}\}/)
     // Focus steps the tint AND darkens the side lines (--glass-edge-focus); the
     // capsule's neutral focus cue is that pair, never an accent ring.
     expect(INDEX_CSS).toMatch(/\.glass-shadow:focus-within:not\(\.glass-accent, \.glass-warn\) \{ --glass-tint: var\(--glass-tint-focus\); --glass-edge: var\(--glass-edge-focus\); \}/)
-    expect(INDEX_CSS).not.toMatch(/\.liquid-glass[^{]*\.composer-halo/)
+    expect(INDEX_CSS).not.toContain('composer-halo')
+    expect(INDEX_CSS).not.toMatch(/\.glass-shadow[^{]* \{[^}]*--accent/)
+    expect(CHAT_INPUT_SRC).not.toContain('composer-halo')
+    expect(CHAT_INPUT_SRC).not.toContain('focus-within:border-accent')
+    // The Settings search bar follows the same rule: its boxed input keeps the
+    // shared `focus-ring` shape but swaps the accent for a neutral border + halo.
+    expect(SETTINGS_SEARCH_SRC).toMatch(/className="settings-search relative shrink-0"/)
+    // The ring must stay a ring: 60% text over the border token clears 3:1 against the field in both polarities (Opus, round 2); --border-strong alone did not.
+    expect(INDEX_CSS).toMatch(/\.settings-search \.focus-ring:focus-visible\{border-color:color-mix\(in srgb,var\(--text\) 60%,var\(--border\)\);\n\s+box-shadow:0 0 0 3px color-mix\(in srgb,var\(--text\) 22%,transparent\),0 0 20px rgba\(0,0,0,\.06\)\}/)
   })
 
   // There is ONE material: every dock surface is the primitive rendered as its

@@ -5,7 +5,7 @@
  * the transcript scrolling under it) and the mobile Settings bottom search
  * capsule. Photographs the REAL built SPA (website/dist) over a stubbed
  * dashboard API in both polarities, so the frosted --glass-tint, the top/bottom
- * specular band and the composer halo are the shipped ones, not a mock. The
+ * specular band and the neutral glass-shadow are the shipped ones, not a mock. The
  * long-transcript scene also asserts the floating-dock geometry, and the
  * `spawn-flow` scene records the approval band's three-step transition as a
  * GIF (needs ffmpeg on PATH). Nothing in CI runs this file.
@@ -224,6 +224,35 @@ async function main() {
         await page.waitForTimeout(250)
         console.log(`chat/${theme}/long: dock stops ${gutter.reserved}px short of the scrollbar column; wheel in the ${Math.round(gutter.colLeft - gutter.dockLeft)}px gutter scrolled the transcript ${Math.round(gutter.before - after)}px`)
       }
+      // Scroll up far enough that a message body runs under the WHOLE dock,
+      // the context shelf included: the shelf sits below the glass on the
+      // bare transcript and stands on the `glass-shelf` fade (nothing at the
+      // pane's bottom edge, page colour by 60% of its height), so a chip label
+      // never reads against text scrolling under it. Assert the fade is there,
+      // starts at the pane's edge and does not touch the pane, then photograph
+      // the dock's bottom edge.
+      const shelfGeo = await page.evaluate(() => {
+        const el = document.querySelector('.chat-container'); el.scrollTop = el.scrollHeight - el.clientHeight - 420
+        const shelf = document.querySelector('[data-testid="composer-context-shelf"]')
+        const dock = document.querySelector('[data-testid="composer-dock"]')
+        if (!shelf || !dock) return null
+        const before = getComputedStyle(shelf, '::before')
+        const s = shelf.getBoundingClientRect(), d = dock.getBoundingClientRect()
+        return { bg: before.backgroundImage, z: before.zIndex, top: s.top, dockBottom: d.bottom, dockLeft: d.left, dockWidth: d.width, shelfBottom: s.bottom, dockBg: getComputedStyle(dock, '::before').backgroundImage }
+      })
+      if (!shelfGeo) throw new Error(`chat/${theme}/long: shelf or dock missing`)
+      if (!/linear-gradient\(/.test(shelfGeo.bg) || shelfGeo.z !== '-1') throw new Error(`chat/${theme}/long: shelf has no fade behind it (${shelfGeo.bg} z=${shelfGeo.z})`)
+      if (shelfGeo.top - shelfGeo.dockBottom > 1) throw new Error(`chat/${theme}/long: the fade starts ${shelfGeo.top - shelfGeo.dockBottom}px below the pane, not at its edge`)
+      if (/linear-gradient\(/.test(shelfGeo.dockBg)) throw new Error(`chat/${theme}/long: the pane itself carries a fade (${shelfGeo.dockBg})`)
+      await page.waitForTimeout(600)
+      await page.screenshot({
+        path: `${OUT}/composer-${theme}-long-shelf-crop.png`,
+        clip: { x: Math.max(0, shelfGeo.dockLeft - 40), y: Math.max(0, shelfGeo.dockBottom - 120), width: shelfGeo.dockWidth + 80, height: (shelfGeo.shelfBottom - shelfGeo.dockBottom) + 150 },
+      })
+      console.log('wrote', `${OUT}/composer-${theme}-long-shelf-crop.png`)
+      // The same position, whole page: text under every part of the dock.
+      await page.screenshot({ path: `${OUT}/composer-${theme}-long-under.png` })
+      console.log('wrote', `${OUT}/composer-${theme}-long-under.png`)
       // Now scroll up so a message body, not the tail padding, sits under the glass.
       await page.evaluate(() => { const el = document.querySelector('.chat-container'); if (el) el.scrollTop = el.scrollHeight - el.clientHeight - 180 })
       await page.waitForTimeout(600)
@@ -310,8 +339,44 @@ async function main() {
         path: `${OUT}/composer-${theme}-rest-crop.png`,
         clip: { x: Math.max(0, box.x - 40), y: Math.max(0, box.y - 140), width: box.width + 80, height: box.height + 180 },
       })
+      const dockEl = page.getByTestId('composer-dock').first()
+      const wrapEl = page.getByTestId('input-wrapper').first()
+      const restDock = await dockEl.evaluate(el => ({ shadow: getComputedStyle(el).boxShadow, tint: getComputedStyle(el).getPropertyValue('--glass-tint').trim() }))
+      const restBorder = await wrapEl.evaluate(el => getComputedStyle(el).borderTopColor)
       await page.getByLabel('Message input').first().click()
       await page.waitForTimeout(300)
+      // Focus is the glass itself getting a step clearer: the neutral shadow
+      // deepens and the tint steps, and NOTHING turns the theme colour -- no
+      // accent glow on the dock, no accent border on the wrapper.
+      const focusDock = await dockEl.evaluate(el => ({ shadow: getComputedStyle(el).boxShadow, tint: getComputedStyle(el).getPropertyValue('--glass-tint').trim() }))
+      const focusBorder = await wrapEl.evaluate(el => getComputedStyle(el).borderTopColor)
+      if (focusDock.shadow === restDock.shadow) throw new Error(`chat/${theme}: dock shadow unchanged on focus (${focusDock.shadow})`)
+      if (!/^rgba\(0, 0, 0, [\d.]+\) 0px 0px 18px 0px$/.test(focusDock.shadow)) throw new Error(`chat/${theme}: focused dock shadow is not the neutral glass-shadow: ${focusDock.shadow}`)
+      if (focusDock.tint === restDock.tint) throw new Error(`chat/${theme}: dock tint unchanged on focus (${focusDock.tint})`)
+      if (focusBorder !== restBorder) throw new Error(`chat/${theme}: wrapper border changed on focus (${restBorder} -> ${focusBorder}); the accent focus border is back -- the composer's focus cue must be the glass, not a themed border`)
+      console.log(`chat/${theme}: focus shadow ${restDock.shadow} -> ${focusDock.shadow}; tint ${restDock.tint} -> ${focusDock.tint}; border ${focusBorder} (unchanged)`)
+    }
+    if (variant === 'approval') {
+      // A pending decision keeps the warm glow in the shadow slot, and the
+      // textarea must still get a focus cue: the tint + edge step rides
+      // under the glow (WCAG 2.4.7 -- no state without a visible cue).
+      await page.mouse.click(700, 200)
+      await page.waitForTimeout(300)
+      const dockEl = page.getByTestId('composer-dock').first()
+      const read = () => dockEl.evaluate(el => ({ shadow: getComputedStyle(el).boxShadow, tint: getComputedStyle(el).getPropertyValue('--glass-tint').trim(), edge: getComputedStyle(el).getPropertyValue('--glass-edge').trim() }))
+      const rest = await read()
+      await page.getByLabel('Message input').first().click()
+      await page.waitForTimeout(300)
+      const focus = await read()
+      if (/rgba\(0, 0, 0, [\d.]+\) 0px 0px 18px 0px/.test(rest.shadow)) throw new Error(`chat/${theme}/approval: the neutral glass-shadow displaced the approval glow at rest (${rest.shadow})`)
+      if (/rgba\(0, 0, 0, [\d.]+\) 0px 0px 18px 0px/.test(focus.shadow)) throw new Error(`chat/${theme}/approval: the neutral glass-shadow displaced the approval glow on focus (${focus.shadow})`)
+      if (focus.tint === rest.tint) throw new Error(`chat/${theme}/approval: dock tint unchanged on focus while a decision is pending (${focus.tint})`)
+      if (focus.edge === rest.edge) throw new Error(`chat/${theme}/approval: dock edge unchanged on focus while a decision is pending (${focus.edge})`)
+      console.log(`chat/${theme}/approval: focus tint ${rest.tint} -> ${focus.tint}; edge ${rest.edge} -> ${focus.edge}; shadow stays the glow`)
+      await page.screenshot({
+        path: `${OUT}/composer-${theme}-approval-focused-crop.png`,
+        clip: { x: Math.max(0, box.x - 40), y: Math.max(0, box.y - 140), width: box.width + 80, height: box.height + 180 },
+      })
     }
     await page.screenshot({ path: `${OUT}/composer-${theme}${variant ? '-' + variant : ''}.png` })
     await page.screenshot({
@@ -374,6 +439,27 @@ async function main() {
     if (dialogs) throw new Error(`settings-desktop/${theme}: ${dialogs} unexpected dialog(s) open`)
     await page.screenshot({ path: `${OUT}/settings-desktop-${theme}.png` })
     console.log('wrote', `${OUT}/settings-desktop-${theme}.png`)
+    // The desktop search bar's focus is neutral like the glass panes': the
+    // shared `focus-ring` shape, but a darker border and a soft neutral halo,
+    // never the theme accent. Focus via the keyboard so :focus-visible matches
+    // the way it does for a typing affordance, then read the computed ring.
+    const search = page.locator('.settings-search input').first()
+    if (!(await search.count())) throw new Error(`settings-desktop/${theme}: search bar missing`)
+    const accent = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim())
+    const restRing = await search.evaluate(el => ({ border: getComputedStyle(el).borderTopColor, shadow: getComputedStyle(el).boxShadow }))
+    await search.focus()
+    await page.waitForTimeout(300)
+    const focusRing = await search.evaluate(el => ({ border: getComputedStyle(el).borderTopColor, shadow: getComputedStyle(el).boxShadow }))
+    const accentRgb = await page.evaluate(c => { const d = document.createElement('div'); d.style.color = c; document.body.appendChild(d); const v = getComputedStyle(d).color; d.remove(); return v }, accent)
+    if (focusRing.border === restRing.border && focusRing.shadow === restRing.shadow) throw new Error(`settings-desktop/${theme}: search bar shows no focus cue`)
+    if (focusRing.border === accentRgb || focusRing.shadow.includes(accentRgb.replace(/^rgb\(([^)]*)\)$/, 'rgba($1'))) throw new Error(`settings-desktop/${theme}: search bar focus is the accent (${focusRing.border}; ${focusRing.shadow})`)
+    console.log(`settings-desktop/${theme}: search focus border ${restRing.border} -> ${focusRing.border}; shadow ${focusRing.shadow}`)
+    const sbox = await search.boundingBox()
+    await page.screenshot({
+      path: `${OUT}/settings-desktop-${theme}-search-focused-crop.png`,
+      clip: { x: Math.max(0, sbox.x - 24), y: Math.max(0, sbox.y - 24), width: sbox.width + 48, height: sbox.height + 48 },
+    })
+    console.log('wrote', `${OUT}/settings-desktop-${theme}-search-focused-crop.png`)
     await context.close()
   }
 

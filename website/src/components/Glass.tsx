@@ -22,15 +22,16 @@
  * the entrance animation and its own `onClick`, and the effect layers sit
  * inside it under the label. `className` and `style` go on that host and carry
  * LAYOUT (margin, width, flex, padding) plus the box-shadow state the caller
- * owns — `glass-shadow` for the neutral rest shadow, `composer-halo` for the
- * session composer's focus glow, or `approval-glow` while a decision is
- * pending — because which shadow a pane wears at this instant is the caller's
- * state, not the material's. A hue is mixed INTO the tint with `glass-accent`
+ * owns — `glass-shadow` for the neutral rest shadow every pane wears (the
+ * session composer included), plus `approval-glow` stacked on it while a
+ * decision is pending — because which shadow a pane wears at this instant is
+ * the caller's state, not the material's. A hue is mixed INTO the tint with `glass-accent`
  * (picked chip, tip card) or `glass-warn` (incognito chip), and `glass-hover`
  * brightens an interactive pane a step on hover — all three swap `--glass-tint`
- * on the host (index.css), so the pane stays the same material. The accent
- * focus glow is the composer's alone: the material itself never lights up in
- * the theme color. The optics are not open for override here — change the
+ * on the host (index.css), so the pane stays the same material. Focus is the
+ * shared `.glass-shadow:focus-within` step — the tint and the side lines step
+ * up, the shadow deepens — on every pane alike: the material never lights up
+ * in the theme color. The optics are not open for override here — change the
  * recipe, not the call site.
  */
 import { forwardRef, type ReactElement, type Ref } from 'react'
