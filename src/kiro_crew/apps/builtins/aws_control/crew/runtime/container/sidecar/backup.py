@@ -513,24 +513,35 @@ def _live_transcripts(settings: Settings) -> tuple[list[Path], list[tuple[str, s
     # swapped between them, so the listing walks the very tree the check refused while the
     # check reports it sound -- the same one-directory-throughout rule publication follows,
     # and the refusal is worth nothing without it.
+    # The descriptor is held until the LAST ``DirEntry`` has been classified, not released
+    # when the listing ends. ``os.scandir(fd)`` hands back entries whose ``dir_fd`` is this
+    # very descriptor and whose ``path`` is the bare name, so an entry whose type ``readdir``
+    # did not report -- ``DT_UNKNOWN``, which CPython documents for network filesystems and
+    # the EFS-mounted data home is one -- answers ``is_dir`` by ``fstatat`` through it. Closed
+    # first, that call is ``EBADF`` on exactly the filesystem this task runs on, and it raises
+    # from inside ``objects_to_back_up``, which ``run_cycle`` calls ABOVE its own ``try`` --
+    # so every cycle would die identically for the life of the task and nothing would ever be
+    # uploaded. The close stays in a ``finally`` so it still happens on the early return and
+    # on any raise.
     try:
-        with os.scandir(fd) as scan:
-            entries = sorted(scan, key=lambda e: e.name)
-    except FileNotFoundError:
-        return [], []
+        try:
+            with os.scandir(fd) as scan:
+                entries = sorted(scan, key=lambda e: e.name)
+        except FileNotFoundError:
+            return [], []
+        found: list[Path] = []
+        for entry in entries:
+            if not entry.name.endswith(keys.TRANSCRIPT_SUFFIX):
+                continue
+            # ``follow_symlinks=False`` so a link to a directory is not read as one file;
+            # the shape is decided again on the descriptor, and this only decides what to
+            # put in the list.
+            if entry.is_dir(follow_symlinks=False):
+                continue
+            found.append(root / entry.name)
+        return found, []
     finally:
         os.close(fd)
-    found: list[Path] = []
-    for entry in entries:
-        if not entry.name.endswith(keys.TRANSCRIPT_SUFFIX):
-            continue
-        # ``follow_symlinks=False`` so a link to a directory is not read as one file;
-        # the shape is decided again on the descriptor, and this only decides what to
-        # put in the list.
-        if entry.is_dir(follow_symlinks=False):
-            continue
-        found.append(root / entry.name)
-    return found, []
 
 
 def _is_shape_error(exc: OSError) -> bool:
@@ -625,11 +636,45 @@ def _archived_segments(
     # directories the moment the root moves between them, so the refusal the check earns is
     # spent walking the tree it refused. ``fwalk`` starts at the inode the descent validated.
     try:
-        for parent, dirnames, filenames, _dir_fd in os.fwalk(
+        for parent, dirnames, filenames, dir_fd in os.fwalk(
             dir_fd=fd, follow_symlinks=False, onerror=collect
         ):
             dirnames.sort()
             base = root if parent == "." else root / parent
+            # A LINKED subdirectory is the one drop the collector above cannot see.
+            # ``fwalk`` with ``follow_symlinks=False`` does not descend it -- and does not
+            # report it either: it opens the name, compares that descriptor's ``stat``
+            # against the name's ``lstat``, and on a mismatch simply drops the entry
+            # without calling ``onerror``. So its segments reach neither ``found`` nor
+            # either refusal list, the cycle reports itself COMPLETE, the pointer advances
+            # over an index naming conversations whose archived halves were never uploaded,
+            # and the archive is on an ephemeral disk -- gone, with no record of which ones.
+            # That is the same plant this function already answers loudly one component
+            # higher, at the archive root, so going silent one level down is an
+            # inconsistency in this defence rather than a case it decided to accept.
+            # Named here, and removed from ``dirnames`` so the drop is this function's own
+            # rather than a side effect of the walk. Permanent, like the root's shape
+            # refusals: a link does not become a directory on the next cycle, so it is
+            # UNREACHABLE and the pointer stays free to advance rather than the pair being
+            # withheld forever.
+            for name in list(dirnames):
+                try:
+                    linked = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
+                except OSError as exc:
+                    dirnames.remove(name)
+                    collect(exc)
+                    continue
+                if not linked:
+                    continue
+                dirnames.remove(name)
+                walk_unreachable.append(
+                    (
+                        str(base / name),
+                        "a directory under the archive is a symbolic link; nothing under it "
+                        "is listed, because a link there names files this task does not own, "
+                        "and its segments are not in this cycle's set",
+                    )
+                )
             for name in sorted(filenames):
                 found.append(base / name)
     finally:
@@ -711,11 +756,22 @@ def objects_to_back_up(settings: Settings, *, slot: str = keys.AUTHORITY_SLOTS[0
             gone.append(name)
             continue
         authority.append((keys.authority_slot_key(settings, slot, name), snapshot))
-    archived, archive_refused, archive_unreachable = _archived_segments(settings)
-    refused.extend(archive_refused)
-    unreachable.extend(archive_unreachable)
-    live, live_refused = _live_transcripts(settings)
-    refused.extend(live_refused)
+    # The open descriptors are OWNED here until :class:`BackupSet` takes them. Their only
+    # close site is the ``finally: plan.close_authority()`` in :func:`run_cycle`, and
+    # ``run_cycle`` calls this function ABOVE that ``try`` -- so a raise from either
+    # enumerator below escapes with the snapshots still open, and a task that raises once
+    # per interval leaks two descriptors a cycle until ``EMFILE`` makes ``open_snapshot``
+    # fail for a reason that looks nothing like the cause.
+    try:
+        archived, archive_refused, archive_unreachable = _archived_segments(settings)
+        refused.extend(archive_refused)
+        unreachable.extend(archive_unreachable)
+        live, live_refused = _live_transcripts(settings)
+        refused.extend(live_refused)
+    except BaseException:
+        for _key, snapshot in authority:
+            snapshot.close()
+        raise
     data = [(keys.data_key(settings, path), path) for path in live + archived]
     return BackupSet(
         data=data,

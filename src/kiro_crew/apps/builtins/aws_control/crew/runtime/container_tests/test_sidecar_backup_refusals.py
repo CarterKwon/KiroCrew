@@ -292,3 +292,127 @@ def test_a_file_without_the_transcript_suffix_is_not_in_the_set(tmp_path):
     paths = [path.name for _, path in backup_mod.objects_to_back_up(settings).data]
 
     assert "notes.txt" not in paths
+
+
+def test_an_entry_whose_type_readdir_withheld_is_classified_before_the_fd_closes(
+    tmp_path, monkeypatch
+):
+    """``DT_UNKNOWN`` makes ``is_dir`` stat through the listing's own descriptor.
+
+    ``os.scandir(fd)`` hands back entries whose ``dir_fd`` IS that descriptor and whose
+    ``path`` is the bare name, so an entry whose type ``readdir`` did not report answers
+    ``is_dir`` by ``fstatat`` through it. CPython documents that type for network
+    filesystems, and the data home is EFS-mounted, so this is the deployed case rather
+    than a corner of it.
+
+    Pinned because the failure is total and silent in shape: classified after the close,
+    the entry raises ``EBADF`` from inside ``objects_to_back_up``, which ``run_cycle``
+    calls ABOVE its own ``try`` -- so every cycle for the life of the task dies
+    identically and not one transcript, segment or authority file is ever uploaded.
+    """
+    settings = _settings(tmp_path)
+    name = f"{STEM}{keys.TRANSCRIPT_SUFFIX}"
+    _transcript(settings, b"{}")
+    real_scandir = os.scandir
+
+    class _TypeWithheld:
+        """A ``DirEntry`` that has to reach the kernel to answer ``is_dir``."""
+
+        def __init__(self, entry_name: str, dir_fd: int) -> None:
+            self.name = entry_name
+            self._dir_fd = dir_fd
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            # Exactly what CPython's fallback does, and the one call a closed
+            # descriptor turns into EBADF.
+            os.fstat(self._dir_fd)
+            return False
+
+    def scandir_withholding_types(arg):
+        if not isinstance(arg, int):
+            return real_scandir(arg)
+
+        class _Listing:
+            def __enter__(self) -> list[_TypeWithheld]:
+                return [_TypeWithheld(name, arg)]
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        return _Listing()
+
+    monkeypatch.setattr(os, "scandir", scandir_withholding_types)
+    found, refused = backup_mod._live_transcripts(settings)
+
+    assert refused == []
+    assert [path.name for path in found] == [name]
+
+
+def test_a_linked_directory_under_the_archive_is_named_rather_than_walked_past(tmp_path):
+    """The one drop ``onerror`` cannot see, and the loudest thing it could be.
+
+    ``os.fwalk(follow_symlinks=False)`` does not descend a linked subdirectory and does
+    not report it: it compares the name's ``lstat`` against the opened descriptor's
+    ``stat`` and drops the entry without calling ``onerror``. Dropped that way its
+    segments reach neither the set nor either refusal list, so the cycle reports itself
+    COMPLETE, the pointer advances over an index naming conversations whose archived
+    halves were never uploaded, and the archive is on an ephemeral disk -- gone, with no
+    record of which ones.
+
+    Unreachable rather than refused, on the same permanence rule the archive root
+    follows: a link does not become a directory next cycle, so withholding the pair on
+    it would never end.
+    """
+    settings = _settings(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "segment-1.jsonl").write_bytes(b"not this task's bytes\n")
+    settings.archive_dir.mkdir(parents=True, exist_ok=True)
+    (settings.archive_dir / "kept.jsonl").write_bytes(b"{}")
+    link = settings.archive_dir / "linked"
+    link.symlink_to(outside, target_is_directory=True)
+
+    found, refused, unreachable = backup_mod._archived_segments(settings)
+
+    assert [path.name for path in found] == ["kept.jsonl"]
+    assert [where for where, _ in unreachable] == [str(link)]
+    assert refused == []
+
+
+def test_the_authority_descriptors_are_closed_when_an_enumerator_raises(tmp_path, monkeypatch):
+    """The authority pair is opened first, so a later raise must not strand it.
+
+    ``run_cycle``'s ``finally: plan.close_authority()`` is the only close site, and it
+    calls this function ABOVE that ``try`` -- so a raise from an enumerator escapes with
+    both descriptors still open and this function is the only place that can release
+    them.
+
+    Asserted on the snapshots THEMSELVES rather than on a descriptor count, and the test
+    keeps a reference to each. Nothing else holds one once the raise unwinds, so
+    refcounting closes the file objects the moment they are dropped and a count taken
+    afterwards is identical whether or not anything released them on purpose -- it would
+    pass with the release removed, which is a test that measures nothing. Holding the
+    reference is what makes "released deliberately" the only way this can be green.
+    """
+    settings = _settings(tmp_path)
+    _transcript(settings, b"{}")
+    opened: list[object] = []
+    real_open_snapshot = backup_mod.open_snapshot
+
+    def recording_open_snapshot(path, *, root):
+        snapshot = real_open_snapshot(path, root=root)
+        if snapshot is not None:
+            opened.append(snapshot)
+        return snapshot
+
+    def stale(_settings_arg):
+        raise OSError("stale file handle")
+
+    monkeypatch.setattr(backup_mod, "open_snapshot", recording_open_snapshot)
+    monkeypatch.setattr(backup_mod, "_live_transcripts", stale)
+
+    with pytest.raises(OSError):
+        backup_mod.objects_to_back_up(settings)
+
+    assert len(opened) == len(keys.AUTHORITY_NAMES)
+    assert [snapshot.fh.closed for snapshot in opened] == [True] * len(opened)
