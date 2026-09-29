@@ -1453,7 +1453,16 @@
       "copied": "Copied",
       "copy_failed": "Copy failed — your browser blocked clipboard access. Select the text and copy it yourself.",
       "copy_nothing": "Nothing here to copy.",
-      "copy_hint": "Copy link"
+      "copy_hint": "Copy link",
+      "cmd_search_mates": "Search Crewmates",
+      "cmd_search_mates_sub": "Find a crewmate by name and open its chat thread.",
+      "placeholder_mates": "Search all crewmates…",
+      "action_search_mates": "Search Crewmates",
+      "action_open_mate": "Open Chat",
+      "action_show_all_mates": "Show All Crewmates",
+      "fallback_mates": "Search crewmates for “{{query}}”",
+      "no_match_show_all_mates": "No crewmates match “{{query}}” — show all instead",
+      "no_mates_yet": "No crewmates yet. Add one on the Crewmates page and it shows up here."
     },
     "papyrus": {
       "workspace": {

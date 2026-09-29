@@ -187,6 +187,30 @@ const FRECENCY_WEIGHT = 6
 const PER_GROUP_LIMIT = 6
 
 /**
+ * Wider cap for the `commands` group.
+ *
+ * The group holds two kinds of row that do not compete on equal terms: the
+ * product's own BUILTINS, a fixed set the reader cannot change, and CONTRIBUTED
+ * rows an installed app declares. Under one shared cap every builtin added spends a
+ * contributed row's slot — and at six builtins (New Session, Toggle Theme, and one
+ * corpus entry each for sessions, artifacts, folders and crewmates) the group is
+ * full before any app has contributed anything.
+ *
+ * That eviction is the worst property a cap can have, because nothing on screen
+ * says it happened: the app installed fine, its manifest was accepted, its row
+ * simply is not there. Adding the crewmates row is what crossed the line, and a
+ * test caught it — but the sixth builtin was not the defect, a cap that counts
+ * builtins against apps was.
+ *
+ * Eight rather than a derived count: the group's own builtins are not visible from
+ * this module, and a cap that grew with every row added would stop being a cap. Two
+ * contributed rows on a page nobody has typed into is a launcher showing that the
+ * seam exists; the rest are one keystroke away, because a typed query ranks every
+ * row on its match and this cap is not what holds them back.
+ */
+const COMMANDS_LIMIT = 8
+
+/**
  * Penalty applied to an `idleDemote` row while the query is empty.
  *
  * Sized to lose to a single real use, not to hide the row for good: one use scores
@@ -342,7 +366,12 @@ export function rankRootRows(
   const perGroup = new Map<RootGroup, number>()
   const capped: RankedRow[] = []
   for (const row of ranked) {
-    const limit = !q && row.group === 'settings' ? SETTINGS_IDLE_LIMIT : PER_GROUP_LIMIT
+    const limit =
+      !q && row.group === 'settings'
+        ? SETTINGS_IDLE_LIMIT
+        : row.group === 'commands'
+          ? COMMANDS_LIMIT
+          : PER_GROUP_LIMIT
     const seen = perGroup.get(row.group) ?? 0
     if (seen >= limit) continue
     perGroup.set(row.group, seen + 1)

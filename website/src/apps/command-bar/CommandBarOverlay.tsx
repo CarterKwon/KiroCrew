@@ -49,6 +49,8 @@ import {
 import { createArtifactsProvider } from '../../components/commandPalette/providers/artifactsProvider'
 import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
 import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
+import { createMatesProvider, matesIcon, mateRoute } from './matesProvider'
+import type { KiroCrewAgent } from '../../components/AgentSelector'
 import { useFolderSortRead, type FolderSortConfigBody } from '../../hooks/useFolderSortMode'
 import { useSessionsProvider } from '../../components/commandPalette/providers/sessionsProvider'
 import type { Result } from '../../components/commandPalette/types'
@@ -92,7 +94,7 @@ import { useImeGuard } from '../../hooks/useImeGuard'
  */
 
 /** Scoped views the bar can enter. Each one owns its own engine. */
-type Scope = null | 'sessions' | 'artifacts' | 'folders'
+type Scope = null | 'sessions' | 'artifacts' | 'folders' | 'mates'
 
 const SESSIONS_MIN_CHARS = 2
 /**
@@ -116,6 +118,16 @@ const ARTIFACTS_MIN_CHARS = 2
  * and the listing state is a shortcut to something recent, not an inventory.
  */
 const ARTIFACTS_ROW_LIMIT = 12
+/**
+ * How long the crewmate roster stays fresh inside one visit.
+ *
+ * Longer than the 15s the views above use, because this corpus changes on a human
+ * timescale: a crew is added from the Crewmates page, not by an agent's turn, so a
+ * reader who re-enters the view a minute later is looking at the same roster. The
+ * fields that DO change per turn — whether a mate is working — are not in this
+ * payload at all; they come from the live slot frames, which are never cached.
+ */
+const MATES_STALE_MS = 60_000
 const DEBOUNCE_MS = 150
 
 /**
@@ -306,6 +318,14 @@ type Slot =
    * them can disagree about which corpus the Enter reaches.
    */
   | { key: string; tag: 'fallback-folders' }
+  /**
+   * Carry the typed text into the crewmates view.
+   *
+   * Its own tag for the reason the two above give: the footer's action name, the
+   * rendered row and the activation all switch on the tag, so none of them can
+   * disagree about which corpus the Enter reaches.
+   */
+  | { key: string; tag: 'fallback-mates' }
   /** Hand the typed text to an agent — the active session, or a new one. */
   | { key: string; tag: 'ask' }
   /** The dead end's way out: the corpora this surface does not reach. */
@@ -316,6 +336,8 @@ type Slot =
   | { key: string; tag: 'retry-artifacts' }
   /** Re-run a folder listing that failed. */
   | { key: string; tag: 'retry-folders' }
+  /** Re-run a crewmate listing that failed. */
+  | { key: string; tag: 'retry-mates' }
   /** Drop the query and fall back to the recent sessions listing. */
   | { key: string; tag: 'clear-query' }
   /**
@@ -327,6 +349,14 @@ type Slot =
    * and `actionLabel` is pure over the slot precisely so it cannot.
    */
   | { key: string; tag: 'clear-query-folders' }
+  /**
+   * Drop the query and fall back to the whole crew roster.
+   *
+   * Separate from the two above for the reason they are separate from each other:
+   * the destination is named in the row's own words, and `actionLabel` is pure over
+   * the slot precisely so it cannot read the live scope to pick between them.
+   */
+  | { key: string; tag: 'clear-query-mates' }
 
 /**
  * What Enter on this slot will do, named for the footer.
@@ -362,6 +392,11 @@ function actionLabel(slot: Slot): string {
       // the rows that approve or merge.
       if (slot.row.providerId === 'artifacts') return i18nT('apps.commandBar.action_open_artifact')
       if (slot.row.providerId === 'folders') return i18nT('apps.commandBar.action_open')
+      // Named for the DESTINATION, not the object: Enter lands on the mate's own chat
+      // thread, and a bare "Open" would leave a reader guessing between that and a
+      // settings page for the crew. The verb is deliberately not "Run" — that is this
+      // footer's strongest word, reserved for the rows that approve or merge.
+      if (slot.row.providerId === 'mates') return i18nT('apps.commandBar.action_open_mate')
       return i18nT('apps.commandBar.action_open_session')
     case 'fallback':
       return i18nT('apps.commandBar.action_search_sessions')
@@ -369,6 +404,8 @@ function actionLabel(slot: Slot): string {
       return i18nT('apps.commandBar.action_search_artifacts')
     case 'fallback-folders':
       return i18nT('apps.commandBar.action_search_folders')
+    case 'fallback-mates':
+      return i18nT('apps.commandBar.action_search_mates')
     case 'ask':
       return i18nT('apps.commandBar.action_ask')
     case 'recovery':
@@ -376,11 +413,14 @@ function actionLabel(slot: Slot): string {
     case 'retry':
     case 'retry-artifacts':
     case 'retry-folders':
+    case 'retry-mates':
       return i18nT('apps.commandBar.retry')
     case 'clear-query':
       return i18nT('apps.commandBar.action_show_recent')
     case 'clear-query-folders':
       return i18nT('apps.commandBar.action_show_all_folders')
+    case 'clear-query-mates':
+      return i18nT('apps.commandBar.action_show_all_mates')
   }
 }
 
@@ -734,6 +774,75 @@ export default function CommandBarOverlay({
     [dispatch, navigate, queryClient, folderSortMode],
   )
 
+  /**
+   * Which crewmates are working, keyed by crew NAME.
+   *
+   * Derived from the same live slot frames the attention group above reads, so the
+   * running indicator costs this surface no request and cannot disagree with what the
+   * Crewmates page shows — that page reads `running || subagents_running` off these
+   * same frames.
+   *
+   * Keyed on `agent` rather than on the slot key, and that is sound because a member
+   * slot is BORN with its crew pinned: the thread route sets `slot.agent` to the
+   * member's exact name and refuses a slot whose agent is anything else. The slot key
+   * would need the member's persisted `member_id` to reconstruct, which the catalog
+   * rows do not carry.
+   *
+   * A mate with several member slots is working if ANY of them is, which is the
+   * question the reader is asking: whether interrupting would land on a busy agent.
+   */
+  const runningMates = useMemo(() => {
+    const byName = new Set<string>()
+    for (const slot of liveSlots) {
+      if (slot.mode !== 'member') continue
+      if (!(slot.running || slot.subagents_running)) continue
+      if (slot.agent) byName.add(slot.agent)
+    }
+    return byName
+  }, [liveSlots])
+
+  /**
+   * The crewmates view's engine — this app's own roster corpus
+   * (`./matesProvider`), wired to THIS surface's seams.
+   *
+   * Inert on construction, like the three engines above: `fetchQuery` runs from
+   * `search()`, and the only call site is gated on the mates scope. That gating is
+   * what keeps the root request-free, and it matters more here than for folders —
+   * the catalog is not seeded into the cache by any WebSocket push, so there is no
+   * warm-cache path to fall back on and an ungated read would be a real request on
+   * every open.
+   */
+  const mates = useMemo(
+    () =>
+      createMatesProvider({
+        fetchMates: async () => {
+          const body = await queryClient.fetchQuery<{ agents?: KiroCrewAgent[] }>({
+            // Its own key, and deliberately not one of the `['agents-installed']`
+            // entries the crew pages hold: those cache `GET /api/agents`, a different
+            // endpoint with a different shape. No shared cache to join means entering
+            // the view pays one fetch the first time — which is exactly what the view
+            // gesture is for, and why the roster is not in the root.
+            //
+            // Called with NO session key, so the roster is the GLOBAL one. A key would
+            // add whichever chat's project templates are in scope, and this surface
+            // fires from anywhere in the dashboard: the crew a reader is looking for
+            // must not depend on which pane they last touched.
+            queryKey: ['agents', 'catalog', 'command-bar'],
+            queryFn: () => api.agentCatalog(),
+            staleTime: MATES_STALE_MS,
+          })
+          // The key is shared, so what comes back is whatever the last writer put
+          // there. A non-array reaches `.filter` in the provider and throws in render,
+          // which would take the whole launcher down over a payload only this view
+          // needs.
+          return Array.isArray(body?.agents) ? body.agents : []
+        },
+        openMate: name => navigate(mateRoute(name)),
+        isRunning: name => runningMates.has(name),
+      }),
+    [navigate, queryClient, runningMates],
+  )
+
   useEffect(() => {
     if (!open) return
     setQuery('')
@@ -975,6 +1084,28 @@ export default function CommandBarOverlay({
         icon: <Folder size={14} className="lucide-inline" />,
         keywords: ['sidebar', 'tree', 'group'],
       },
+      {
+        // The crew, reached the way the three corpora above are: ONE row that opens a
+        // view. A roster is small enough that flattening it into the first page looks
+        // tempting, and `matesProvider` records why it is not — the catalog behind it
+        // is a FETCH, so a root group would either issue a request on every open of
+        // this bar or show an empty Crewmates group on a cold install.
+        id: 'command:search-mates',
+        title: i18nT('apps.commandBar.cmd_search_mates'),
+        // "Crewmate" is this product's word, the way "artifact" is: a reader who has
+        // not opened the Crewmates page has no reason to know that the agents they
+        // talk to have their own durable threads. The subtitle names what the view
+        // gets them instead of restating the category.
+        subtitle: i18nT('apps.commandBar.cmd_search_mates_sub'),
+        group: 'commands',
+        kind: 'view',
+        view: 'mates',
+        icon: matesIcon(),
+        // The words a reader who has not learned "crewmate" would reach for. `agent`
+        // earns its place above all of them: it is what the rest of the product calls
+        // the thing answering them.
+        keywords: ['crew', 'agent', 'member', 'mate', 'teammate', 'roster'],
+      },
     )
     // Commands contributed by installed apps. This is the seam that lets a row live
     // outside this repository: the app declares the row and what it does, and the
@@ -1163,6 +1294,48 @@ export default function CommandBarOverlay({
     queryKey: ['command-bar', 'folders', folderSortMode, folderQuery],
     queryFn: () => Promise.resolve(folders.search(folderQuery)) as Promise<Result[]>,
     enabled: scope === 'folders',
+    staleTime: 15_000,
+  })
+
+  /**
+   * Crewmates view — ONE engine for both of its states, like the artifacts and
+   * folders views and for the same reason: the provider answers an empty query with
+   * the whole roster, so the listing the view lands on and the filtered list a query
+   * produces are the same call with a different argument.
+   *
+   * No minimum query length. The corpus is in hand once the catalog resolves, so one
+   * character costs a local filter rather than a round trip — and a floor of two
+   * would put the shortest crew names out of reach of their own first letter.
+   *
+   * No row cap either: the roster is the reader's own crew, not a corpus that grows
+   * on its own, which is the argument the folders view makes about the sidebar tree.
+   *
+   * The running set is part of the KEY, not just a dependency of the engine memo.
+   * These rows carry each mate's running state, read at the moment the provider
+   * builds them — and rebuilding the engine does not re-run a resolved query, because
+   * the key is what decides that. Without this the first frame to arrive after the
+   * view opened would leave a "Working…" dot on a mate that had since finished, and a
+   * mate that had just started would render idle.
+   *
+   * A SORTED name list rather than a count or a hash: two mates swapping which of
+   * them is working leaves the count identical, and that is precisely the change that
+   * has to reach the screen. Frames that change nothing about the roster's running
+   * set — a token tick, another surface's slot — produce the same string and cost
+   * nothing. The catalog fetch stays cached under its own 60s key, so a re-derivation
+   * is a local re-map, not a request.
+   */
+  const mateQuery = scope === 'mates' ? debounced.trim() : ''
+  const runningMatesKey = useMemo(() => [...runningMates].sort().join('\u0000'), [runningMates])
+  const {
+    data: mateRows,
+    isFetching: matesFetching,
+    isError: matesError,
+    error: matesSearchError,
+    refetch: refetchMates,
+  } = useQuery({
+    queryKey: ['command-bar', 'mates', mateQuery, runningMatesKey],
+    queryFn: () => mates.search(mateQuery) as Promise<Result[]>,
+    enabled: scope === 'mates',
     staleTime: 15_000,
   })
 
@@ -1421,6 +1594,20 @@ export default function CommandBarOverlay({
       }
       return out
     }
+    if (scope === 'mates') {
+      const out: Slot[] = (mateRows ?? []).map(row => ({ key: row.id, tag: 'result' as const, row }))
+      // The same two dead ends the views above have, told apart the same way. The
+      // retry matters more here than anywhere else in this file: the catalog fetch is
+      // the one this surface has no warm-cache path for, and `useAgents` records what
+      // a swallowed failure on this exact endpoint cost — a failed load and a
+      // one-crew install rendered identically, through six triage passes.
+      if (matesError) {
+        out.push({ key: 'slot:retry', tag: 'retry-mates' })
+      } else if (!matesFetching && out.length === 0 && mateQuery) {
+        out.push({ key: 'slot:clear-query', tag: 'clear-query-mates' })
+      }
+      return out
+    }
     const out: Slot[] = ranked.map(row => ({ key: row.id, tag: 'root' as const, row }))
     if (query.trim().length > 0) {
       // The agent goes FIRST among the tail rows. Every other surface in this
@@ -1442,6 +1629,13 @@ export default function CommandBarOverlay({
       // of the three because a typed word is a session title or an artifact name far
       // more often than a folder name.
       out.push({ key: 'slot:fallback-folders', tag: 'fallback-folders' })
+      // And the same way out for the crew, for the same reason: the root holds ONE row
+      // per corpus, so a typed crew name reaches nothing until the reader thinks to
+      // enter the view first and retype it. Last of the four, because a typed word is
+      // a session title or an artifact name far more often than it is a crew's name —
+      // and a crew name that IS typed is often distinctive enough to have already
+      // matched the view row's own keywords above.
+      out.push({ key: 'slot:fallback-mates', tag: 'fallback-mates' })
       // The recovery row exists for the dead end — a typed query that matched
       // nothing — not for every keystroke. Riding the fallback's own condition put a
       // row about switching the feature off under every successful search, and
@@ -1449,7 +1643,7 @@ export default function CommandBarOverlay({
       if (ranked.length === 0) out.push({ key: 'slot:recovery', tag: 'recovery' })
     }
     return out
-  }, [argCommand, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed, artifactSlotRows, artifactsError, artifactsFetching, artifactsQuery, folderQuery, folderRows, foldersError, foldersFetching])
+  }, [argCommand, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed, artifactSlotRows, artifactsError, artifactsFetching, artifactsQuery, folderQuery, folderRows, foldersError, foldersFetching, mateQuery, mateRows, matesError, matesFetching])
 
   const rowCount = slots.length
   /**
@@ -1464,7 +1658,8 @@ export default function CommandBarOverlay({
     rowCount === 0 &&
     ((scope === 'sessions' && (isFetching || (listingArmed && recentRows === undefined))) ||
       (scope === 'artifacts' && (artifactsFetching || artifactRows === undefined)) ||
-      (scope === 'folders' && (foldersFetching || folderRows === undefined)))
+      (scope === 'folders' && (foldersFetching || folderRows === undefined)) ||
+      (scope === 'mates' && (matesFetching || mateRows === undefined)))
 
   useEffect(() => {
     if (selected >= rowCount) setSelected(Math.max(0, rowCount - 1))
@@ -1490,6 +1685,9 @@ export default function CommandBarOverlay({
           return
         case 'fallback-folders':
           enterScope('folders', query)
+          return
+        case 'fallback-mates':
+          enterScope('mates', query)
           return
         case 'ask': {
           // Stops at a FILLED composer rather than sending: the user wrote this
@@ -1517,8 +1715,12 @@ export default function CommandBarOverlay({
         case 'retry-folders':
           void refetchFolders()
           return
+        case 'retry-mates':
+          void refetchMates()
+          return
         case 'clear-query':
         case 'clear-query-folders':
+        case 'clear-query-mates':
           // Emptying the query is what re-arms the listing; the debounced copy has to
           // go with it or the view stays on the failed search for one more tick.
           setQuery('')
@@ -1528,7 +1730,7 @@ export default function CommandBarOverlay({
           return
       }
     },
-    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchSessions, seedNewSession, slots],
+    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchMates, refetchSessions, seedNewSession, slots],
   )
 
   /**
@@ -1761,7 +1963,9 @@ export default function CommandBarOverlay({
         ? i18nT('apps.commandBar.cmd_search_artifacts')
         : scope === 'folders'
           ? i18nT('apps.commandBar.cmd_search_folders')
-          : ''
+          : scope === 'mates'
+            ? i18nT('apps.commandBar.cmd_search_mates')
+            : ''
   /**
    * The failure this change is responsible for, and the only one that gets a notice.
    *
@@ -1771,6 +1975,7 @@ export default function CommandBarOverlay({
    */
   const artifactsFailed = scope === 'artifacts' && !!artifactsError
   const foldersFailed = scope === 'folders' && !!foldersError
+  const matesFailed = scope === 'mates' && !!matesError
   const searchError =
     scope === 'sessions'
       ? sessionsSearchError
@@ -1778,7 +1983,9 @@ export default function CommandBarOverlay({
         ? artifactsSearchError
         : scope === 'folders'
           ? foldersSearchError
-          : undefined
+          : scope === 'mates'
+            ? matesSearchError
+            : undefined
   /**
    * What the failure SAYS, for the scope this change adds.
    *
@@ -1800,7 +2007,7 @@ export default function CommandBarOverlay({
    */
   const searchFailedText = artifactsFailed
     ? i18nT('apps.commandBar.artifact_search_failed')
-    : foldersFailed
+    : foldersFailed || matesFailed
       ? i18nT('apps.commandBar.search_failed')
       : ''
   /**
@@ -1948,6 +2155,20 @@ export default function CommandBarOverlay({
           arrow: true,
           dim: true,
         }
+      case 'fallback-mates':
+        // Named with the query, dim and arrowed like the three rows above it. No
+        // subtitle, and for a different reason than the folders row: the view row this
+        // leads to carries the gloss, and when the typed word matches both ("crew",
+        // "agent") the two rows are on screen together — which is exactly where the
+        // artifacts pair learned that one shared subtitle makes them read as
+        // duplicates. This row names the text it carries; the view row describes the
+        // corpus.
+        return {
+          icon: matesIcon(),
+          title: i18nT('apps.commandBar.fallback_mates', { query }),
+          arrow: true,
+          dim: true,
+        }
       case 'recovery':
         // Naming the corpora this surface does NOT reach -- at the moment the user is
         // looking for them -- is what keeps a typed knowledge or skill name from being
@@ -1997,6 +2218,14 @@ export default function CommandBarOverlay({
           icon: <RotateCcw size={14} className="lucide-inline" />,
           title: i18nT('apps.commandBar.retry'),
         }
+      case 'retry-mates':
+        // Plain Retry, like the two rows above: WHAT failed is said by the
+        // `ErrorNotice` over the list, which is where an error surfaced to the user
+        // belongs (AUTOSDE `errors-use-error-notice`).
+        return {
+          icon: <RotateCcw size={14} className="lucide-inline" />,
+          title: i18nT('apps.commandBar.retry'),
+        }
       case 'retry':
         return {
           icon: <RotateCcw size={14} className="lucide-inline" />,
@@ -2021,6 +2250,14 @@ export default function CommandBarOverlay({
         return {
           icon: <Folder size={14} className="lucide-inline" />,
           title: i18nT('apps.commandBar.no_match_show_all_folders', { query: folderQuery }),
+          dim: true,
+        }
+      case 'clear-query-mates':
+        // The same row again, with the crew glyph: what it returns to is the whole
+        // roster, which has no recency for a clock to stand for either.
+        return {
+          icon: matesIcon(),
+          title: i18nT('apps.commandBar.no_match_show_all_mates', { query: mateQuery }),
           dim: true,
         }
     }
@@ -2174,9 +2411,11 @@ export default function CommandBarOverlay({
                   ? i18nT('apps.commandBar.placeholder_artifacts')
                   : scope === 'folders'
                     ? i18nT('apps.commandBar.placeholder_folders')
-                    : scope
-                      ? i18nT('apps.commandBar.placeholder_sessions')
-                      : i18nT('apps.commandBar.placeholder')
+                    : scope === 'mates'
+                      ? i18nT('apps.commandBar.placeholder_mates')
+                      : scope
+                        ? i18nT('apps.commandBar.placeholder_sessions')
+                        : i18nT('apps.commandBar.placeholder')
             }
             aria-label={i18nT('apps.commandBar.title')}
             // Selection stays on the input and is announced through
@@ -2366,14 +2605,20 @@ export default function CommandBarOverlay({
               // The folders view reaches it the same way and for the same reason, so
               // it gets the same treatment: a reader with no folders is told they
               // have none, not that no sessions matched.
+              //
+              // The crewmates view too — and its version names where to go, because
+              // unlike a folder there is exactly one place a crew is made, and a
+              // reader who opened this view is a reader who wanted one.
               <div role="status" className="px-3 py-6 text-center text-[12px] text-muted">
                 {scope === 'artifacts'
                   ? i18nT('apps.commandBar.no_artifacts_yet')
                   : scope === 'folders'
                     ? i18nT('apps.commandBar.no_folders_yet')
-                    : scope
-                      ? i18nT('apps.commandBar.no_sessions')
-                      : i18nT('apps.commandBar.no_matches')}
+                    : scope === 'mates'
+                      ? i18nT('apps.commandBar.no_mates_yet')
+                      : scope
+                        ? i18nT('apps.commandBar.no_sessions')
+                        : i18nT('apps.commandBar.no_matches')}
               </div>
             )
           ) : (

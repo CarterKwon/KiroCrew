@@ -30,13 +30,13 @@ locally-known rows — sessions awaiting a user decision, commands, app destinat
 settings — and every corpus search is a view the reader ENTERS, so the expensive work is explicit
 and chosen.
 
-Three such views exist: session search, artifact search, and folder search. The artifacts view
+Four such views exist: session search, artifact search, folder search, and crewmate search. The artifacts view
 asks `GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the
 server matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored
 body. Searching what is INSIDE an artifact is a later change, and it is a change to that one
 request.
 
-The folders view is the cheapest of the three, and its shape follows from that. Its corpus is
+The folders view is the cheapest of the four, and its shape follows from that. Its corpus is
 the folder tree the sidebar already holds under `['chat-folders']`, so a keystroke costs a local
 filter rather than a request: it has no minimum query length, where the two views above each
 hold their first characters back, and no row cap, because the count is the reader's own filing
@@ -54,6 +54,41 @@ the `usePaletteActions` route change are wired in `CommandBarOverlay`, which is 
 holding this app's seams. It still renders the host's `Result` row contract, because forking the
 row shape would fork the Enter matrix with it.
 
+The crewmates view (`apps/command-bar/matesProvider.ts`) reaches the reader's own crew: typing
+filters the roster by fuzzy name and Enter lands on that mate's pinned DM thread
+(`/members?member=<name>`, encoded — a crew may be called `Review & QA`). It is a VIEW rather
+than a root group, and the roster's size is the reason it looks like it should be the other way
+round. The deciding fact is that the corpus is a FETCH: `GET /api/agents/catalog`, which
+`useAgents` calls on mount and which no WebSocket push seeds into the cache. A root group would
+therefore either issue that request on every open of the bar — the one invariant this app
+exists for — or subscribe to a cache nothing fills and render an empty Crewmates group on a cold
+install, which reads as the feature being absent. Like the folders view it has no minimum query
+length and no row cap: once the catalog resolves, a keystroke is a local filter over the
+reader's own crew.
+
+Two fields of a row come from different places, and only one of them is cached. Identity,
+label, role and avatar are the catalog's; whether the mate is WORKING is read from the live slot
+frames the root's attention group already uses (`mode === 'member'` and
+`running || subagents_running`), keyed on `slot.agent`, which a member slot is born with pinned
+to its crew's exact name. That running set is part of the view's query KEY, not merely a
+dependency of the engine: rebuilding the engine does not re-run a resolved query, so without it
+a mate that had finished would keep its "Working…" dot for the rest of the stale window. Only
+members are listed — the catalog also answers with installed templates, and a template has no
+DM thread, so a row for one would navigate to a page that cannot open it.
+
+Matching is on NAMES only, over two fields: the displayed label and the immutable `name` a
+display label hides, the latter penalised so the word on screen always outranks the one behind
+it. The description is rendered as the subtitle and deliberately not matched — that would make
+this a content search over prose, and the row could not honestly highlight it.
+
+Adding this view cost the `commands` group its shared cap. Six builtin rows (New Session, Toggle
+Theme, and one corpus entry each for sessions, artifacts, folders and crewmates) exactly filled
+`PER_GROUP_LIMIT`, which silently evicted every app-CONTRIBUTED command from the idle page: the
+app installed fine, its manifest was accepted, its row was simply absent. The group now carries
+its own `COMMANDS_LIMIT` of 8 — room for the seam rather than removal of the cap. A cap that
+counts the product's own builtins against an app's contributions is the defect; the sixth
+builtin only revealed it.
+
 ## Responsibilities
 
 1. **Claim the slot** — declare `ui.overlays` in the manifest and take over the `quick-search`
@@ -62,11 +97,11 @@ row shape would fork the Enter matrix with it.
    rank them, and cap each group
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
-4. **Scopes** — enter a sub-surface (today: session search, artifact name search, and folder
-   search) as a navigation state, with its own engine loaded on entry
+4. **Scopes** — enter a sub-surface (today: session search, artifact name search, folder search,
+   and crewmate search) as a navigation state, with its own engine loaded on entry
 5. **Fallback** — for any non-empty root query, offer Ask plus rows that carry the query into
-   the sessions, artifacts, and folders views; when no root row matches, also offer the app page
-   that can disable Command Bar
+   the sessions, artifacts, folders, and crewmates views; when no root row matches, also offer
+   the app page that can disable Command Bar
 
 ## The overlay seam
 
@@ -196,6 +231,12 @@ that answer an older prefix.
 | the artifacts fallback row issues no request while it is merely OFFERED | offering a way into the corpus becomes a scan on every keystroke, which is the cost this app exists to avoid |
 | the artifacts row cap names its remainder, from OUTSIDE the listbox | a silent slice reads as "these are all of them"; a counted row inside the listbox is an option Enter cannot act on |
 | the root ranks from the live query | a debounced read discards a fast-entered query |
+| the crewmates view is entered, never fetched from the root | the catalog `useAgents` calls on mount becomes a request on every open of the bar |
+| the crewmates view lists MEMBERS only | a template row navigates to a page with no thread to open |
+| a crewmate route is encoded | a crew called `Review & QA` truncates the parameter and opens the page on nothing |
+| a crewmate row is keyed on the immutable `name`, not the display label | a renamed crew routes to a member that does not exist, and reads as idle while it is working |
+| the running set is part of the crewmates query key | a resolved query keeps a finished mate's "Working…" dot for the rest of the stale window |
+| the `commands` group's cap leaves room beyond its builtins | a sixth builtin evicts every app-contributed row with nothing on screen saying so |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
 | the `apps` query is a pure cache consumer (`enabled: false`) | a second identical fetch per open |
 | every `['apps']` reader goes through the one api call | a divergent shape silently poisons the shared cache |

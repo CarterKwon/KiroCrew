@@ -161,6 +161,41 @@ describe('rankRootRows', () => {
     expect(out.some(r => r.id === 'cmd')).toBe(true)
   })
 
+  it('leaves the commands group room for contributed rows beyond its builtins', () => {
+    // The group holds the product's own builtins AND whatever an installed app
+    // declares. Under one shared cap the six builtins fill it, and an app's row is
+    // dropped with nothing on screen saying so — the app installed fine, its
+    // manifest was accepted, its row is simply absent. This is the regression adding
+    // the crewmates row produced, and the reason the group has a cap of its own.
+    const builtins = [
+      'New Session',
+      'Toggle Theme',
+      'Search Sessions',
+      'Search Artifacts',
+      'Search Folders',
+      'Search Crewmates',
+    ].map((title, i) => row({ id: `builtin${i}`, title, group: 'commands' }))
+    // Demoted, the way `CommandBarOverlay` marks an argument-taking contribution: it
+    // sorts last on an empty query, which is exactly where a tight cap removes it.
+    const contributed = [
+      row({ id: 'app-cmd-a', title: 'Approve all PRs', group: 'commands', idleDemote: true }),
+      row({ id: 'app-cmd-b', title: 'Merge all PRs', group: 'commands', idleDemote: true }),
+    ]
+    const ids = rankRootRows([...builtins, ...contributed], '', {}, 0).map(r => r.id)
+    for (const b of builtins) expect(ids).toContain(b.id)
+    expect(ids).toContain('app-cmd-a')
+    expect(ids).toContain('app-cmd-b')
+  })
+
+  it('still caps the commands group, so it cannot become an index', () => {
+    // The wider cap is room for the seam, not its removal: a page nobody has typed
+    // into stays short, and the rest of an app's twenty rows are one keystroke away.
+    const many = Array.from({ length: 20 }, (_, i) =>
+      row({ id: `cmd${i}`, title: `Command ${i}`, group: 'commands' }),
+    )
+    expect(rankRootRows(many, '', {}, 0)).toHaveLength(8)
+  })
+
   it('returns group blocks in launcher order, not in score order', () => {
     // What a launcher leads with is a product decision, so it must not depend on
     // which row happens to score highest — with no usage every score ties and the
